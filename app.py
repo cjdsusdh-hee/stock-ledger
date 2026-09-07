@@ -81,10 +81,9 @@ st.set_page_config(
     layout="wide",
 )
 
-# 사이드바 트리 메뉴 — 모던 SaaS 스타일
+# 사이드바 작업 순서 메뉴
 SIDEBAR_CUSTOM_CSS = """
 <style>
-    /* 사이드바 Expander 테두리 및 배경 깔끔하게 정리 */
     [data-testid="stSidebar"] [data-testid="stExpander"] {
         background-color: transparent !important;
         border: none !important;
@@ -110,7 +109,6 @@ SIDEBAR_CUSTOM_CSS = """
         background-color: #f3f4f6 !important;
     }
 
-    /* 트리 하위 메뉴 버튼만 대상 (사업자 추가/삭제 버튼 제외) */
     [data-testid="stSidebar"] [data-testid="stExpander"] .stButton > button {
         width: 100% !important;
         border: none !important;
@@ -140,7 +138,6 @@ SIDEBAR_CUSTOM_CSS = """
         outline: none !important;
     }
 
-    /* 활성화된 메뉴 (primary) */
     [data-testid="stSidebar"] [data-testid="stExpander"] .stButton > button[kind="primary"],
     [data-testid="stSidebar"] [data-testid="stExpander"] .stButton > button[data-testid="baseButton-primary"] {
         background-color: #eff6ff !important;
@@ -626,9 +623,7 @@ def _open_stock_detail_from_query(storage: Storage, trades: list) -> None:
     if menu in ALL_MENU_KEYS:
         st.session_state.active_menu = menu
         st.session_state.active_category = (
-            "domestic"
-            if menu in DOMESTIC_MENU_KEYS
-            else ("overseas" if menu in OVERSEAS_MENU_KEYS else "interest")
+            "income" if menu == "income" else "work"
         )
         mkt = menu_market(menu)
         if mkt:
@@ -662,7 +657,7 @@ def _render_holdings_html_table(
     sum_cost = 0.0
     sum_pnl = 0.0
 
-    menu = active_menu or st.session_state.get("active_menu", "domestic_dashboard")
+    menu = active_menu or st.session_state.get("active_menu", "ledger")
     mkt = market or menu_market(menu) or MARKET_DOMESTIC
 
     for _, row in pos_df.iterrows():
@@ -802,116 +797,148 @@ def refresh_fifo(
     return compute_positions(trades), trades
 
 
-DOMESTIC_MENU_ITEMS = [
-    ("domestic_dashboard", "📊 대시보드"),
-    ("domestic_trade_input", "📝 매매 입력"),
-    ("domestic_import_export", "📤 Import / Export"),
-    ("domestic_converter", "🔄 증권사 변환기"),
-    ("domestic_base_data", "📋 기초 데이터 등록"),
-    ("domestic_stock_masters", "🏢 거래처 및 종목 관리"),
-    ("domestic_stock_settings", "⚙️ 환경설정 (국내주식 계정코드)"),
+WORK_MENU_ITEMS = [
+    ("setup", "1. 준비"),
+    ("ingest", "2. 거래 넣기"),
+    ("ledger", "3. 잔고·손익"),
+    ("voucher", "4. 회계전표"),
 ]
-OVERSEAS_MENU_ITEMS = [
-    ("overseas_dashboard", "📊 대시보드"),
-    ("overseas_trade_input", "📝 매매 입력"),
-    ("overseas_import_export", "📤 Import / Export"),
-    ("overseas_converter", "🔄 증권사 변환기"),
-    ("overseas_base_data", "📋 기초 데이터 등록"),
-    ("overseas_stock_masters", "🏢 거래처 및 종목 관리"),
-    ("overseas_stock_settings", "⚙️ 환경설정 (해외주식 계정코드)"),
+EXTRA_MENU_ITEMS = [
+    ("income", "이자·배당"),
+    ("codes", "계정코드"),
 ]
-INCOME_MENU_ITEMS = [
-    ("interest_list", "📄 이자·배당 내역 및 전표"),
-    ("interest_settings", "⚙️ 거래처 및 계정과목 설정"),
-]
+WORK_MENU_KEYS = {k for k, _ in WORK_MENU_ITEMS}
+MARKET_MENU_KEYS = WORK_MENU_KEYS | {"codes"}
+INCOME_MENU_KEYS = {"income"}
+ALL_MENU_KEYS = MARKET_MENU_KEYS | INCOME_MENU_KEYS
+DEFAULT_MENU = "ledger"
 
-DOMESTIC_MENU_KEYS = {k for k, _ in DOMESTIC_MENU_ITEMS}
-OVERSEAS_MENU_KEYS = {k for k, _ in OVERSEAS_MENU_ITEMS}
-INCOME_MENU_KEYS = {k for k, _ in INCOME_MENU_ITEMS}
-ALL_MENU_KEYS = DOMESTIC_MENU_KEYS | OVERSEAS_MENU_KEYS | INCOME_MENU_KEYS
-
-_MARKET_TITLE = {
-    MARKET_DOMESTIC: ("국내주식 매매일지 · 잔고 관리", "국내"),
-    MARKET_OVERSEAS: ("해외주식 매매일지 · 잔고 관리", "해외"),
+MENU_PAGE_META: dict[str, tuple[str, str]] = {
+    "setup": ("준비", "증권사·종목 마스터"),
+    "ingest": ("거래 넣기", "파일 업로드 또는 직접 입력"),
+    "ledger": ("잔고·손익", "보유 잔고 · FIFO · 처분손익"),
+    "voucher": ("회계전표", "기간별 전표 다운로드"),
+    "income": ("이자·배당소득", "원천징수 업로드 · 전표"),
+    "codes": ("계정코드", "전표용 계정과목 · 거래처코드"),
 }
 
-MENU_PAGE_META: dict[str, tuple[str, str]] = {}
-for _mkt, (_title, _short) in _MARKET_TITLE.items():
-    prefix = "domestic" if _mkt == MARKET_DOMESTIC else "overseas"
-    MENU_PAGE_META.update(
-        {
-            f"{prefix}_dashboard": (_title, f"{_short} · 대시보드 · 보유 잔고 · FIFO"),
-            f"{prefix}_trade_input": (_title, f"{_short} · 매수·매도 거래 입력"),
-            f"{prefix}_import_export": (_title, f"{_short} · Import / Export · 전표"),
-            f"{prefix}_converter": (_title, f"{_short} · 증권사 거래내역 변환"),
-            f"{prefix}_base_data": (_title, f"{_short} · 기초 데이터(레거시) 등록"),
-            f"{prefix}_stock_masters": (_title, f"{_short} · 거래처·종목 마스터"),
-            f"{prefix}_stock_settings": (_title, f"{_short} · 주식 계정과목 코드 설정"),
-        }
-    )
-MENU_PAGE_META.update(
-    {
-        "interest_list": ("이자·배당소득 관리", "원천징수 업로드 · 전표 다운로드"),
-        "interest_settings": ("이자·배당소득 관리", "거래처·계정과목 설정"),
-    }
-)
+STEP_GUIDES: dict[str, tuple[str, str, str, str]] = {
+    "setup": (
+        "1/4 준비",
+        "증권사(계좌)와 종목을 등록합니다. 없으면 올린 거래는 '미지정'으로 들어갑니다.",
+        "ingest",
+        "다음: 거래 넣기",
+    ),
+    "ingest": (
+        "2/4 거래 넣기",
+        "증권사 원본 파일, 표준 엑셀, 예전 매매일지, 직접 입력 중 하나를 고르세요.",
+        "ledger",
+        "다음: 잔고·손익",
+    ),
+    "ledger": (
+        "3/4 잔고·손익",
+        "FIFO 잔고와 처분손익을 확인합니다. 같은 종목이어도 증권사별로 행이 갈립니다.",
+        "voucher",
+        "다음: 회계전표",
+    ),
+    "voucher": (
+        "4/4 회계전표",
+        "기간을 골라 회계 전표를 받습니다. 계정코드가 비었으면 먼저 계정코드를 저장하세요.",
+        "codes",
+        "계정코드 확인",
+    ),
+    "income": (
+        "이자·배당",
+        "원천징수 파일을 올리고 전표를 받습니다. 계정코드는 아래 메뉴에서 관리합니다.",
+        "codes",
+        "계정코드",
+    ),
+    "codes": (
+        "계정코드",
+        "전표에 들어갈 계정과목과 거래처코드를 저장합니다.",
+        "voucher",
+        "회계전표로",
+    ),
+}
 
-# 구 라벨/세션 값 → active_menu 키 (기본: 국내)
+# 구 라벨/세션/URL 값 → 새 active_menu 키
 _LEGACY_TO_MENU: dict[str, str] = {
-    "dashboard": "domestic_dashboard",
-    "trade_input": "domestic_trade_input",
-    "import_export": "domestic_import_export",
-    "converter": "domestic_converter",
-    "base_data": "domestic_base_data",
-    "stock_masters": "domestic_stock_masters",
-    "stock_settings": "domestic_stock_settings",
-    "domestic_dashboard": "domestic_dashboard",
-    "overseas_dashboard": "overseas_dashboard",
-    "interest_list": "interest_list",
-    "interest_settings": "interest_settings",
-    "대시보드": "domestic_dashboard",
-    "📊 대시보드": "domestic_dashboard",
-    "매매 입력": "domestic_trade_input",
-    "📝 매매 입력": "domestic_trade_input",
-    "Import / Export": "domestic_import_export",
-    "📤 Import / Export": "domestic_import_export",
-    "증권사 변환기": "domestic_converter",
-    "🔄 증권사 변환기": "domestic_converter",
-    "기초 데이터 등록": "domestic_base_data",
-    "📋 기초 데이터 등록": "domestic_base_data",
-    "거래처 및 종목 관리": "domestic_stock_masters",
-    "🏢 거래처 및 종목 관리": "domestic_stock_masters",
-    "환경설정 (주식)": "domestic_stock_settings",
-    "⚙️ 환경설정 (주식)": "domestic_stock_settings",
-    "⚙️ 환경설정 (주식 계정코드)": "domestic_stock_settings",
-    "⚙️ 환경설정 (국내주식 계정코드)": "domestic_stock_settings",
-    "⚙️ 환경설정 (해외주식 계정코드)": "overseas_stock_settings",
-    "환경설정 / 계정과목 관리": "domestic_stock_settings",
-    "⚙️ 환경설정 (계정과목 코드)": "domestic_stock_settings",
-    "내역 업로드·전표": "interest_list",
-    "📄 이자·배당 내역 및 전표": "interest_list",
-    "환경설정 (이자·배당)": "interest_settings",
-    "⚙️ 거래처 및 계정과목 설정": "interest_settings",
+    "setup": "setup",
+    "ingest": "ingest",
+    "ledger": "ledger",
+    "voucher": "voucher",
+    "income": "income",
+    "codes": "codes",
+    "dashboard": "ledger",
+    "trade_input": "ingest",
+    "import_export": "voucher",
+    "converter": "ingest",
+    "base_data": "ingest",
+    "stock_masters": "setup",
+    "stock_settings": "codes",
+    "domestic_dashboard": "ledger",
+    "overseas_dashboard": "ledger",
+    "domestic_trade_input": "ingest",
+    "overseas_trade_input": "ingest",
+    "domestic_import_export": "voucher",
+    "overseas_import_export": "voucher",
+    "domestic_converter": "ingest",
+    "overseas_converter": "ingest",
+    "domestic_base_data": "ingest",
+    "overseas_base_data": "ingest",
+    "domestic_stock_masters": "setup",
+    "overseas_stock_masters": "setup",
+    "domestic_stock_settings": "codes",
+    "overseas_stock_settings": "codes",
+    "interest_list": "income",
+    "interest_settings": "codes",
+    "대시보드": "ledger",
+    "📊 대시보드": "ledger",
+    "매매 입력": "ingest",
+    "📝 매매 입력": "ingest",
+    "Import / Export": "voucher",
+    "📤 Import / Export": "voucher",
+    "증권사 변환기": "ingest",
+    "🔄 증권사 변환기": "ingest",
+    "기초 데이터 등록": "ingest",
+    "📋 기초 데이터 등록": "ingest",
+    "거래처 및 종목 관리": "setup",
+    "🏢 거래처 및 종목 관리": "setup",
+    "환경설정 (주식)": "codes",
+    "⚙️ 환경설정 (주식)": "codes",
+    "⚙️ 환경설정 (주식 계정코드)": "codes",
+    "⚙️ 환경설정 (국내주식 계정코드)": "codes",
+    "⚙️ 환경설정 (해외주식 계정코드)": "codes",
+    "환경설정 / 계정과목 관리": "codes",
+    "⚙️ 환경설정 (계정과목 코드)": "codes",
+    "내역 업로드·전표": "income",
+    "📄 이자·배당 내역 및 전표": "income",
+    "환경설정 (이자·배당)": "codes",
+    "⚙️ 거래처 및 계정과목 설정": "codes",
 }
 
 NEW_STOCK_OPTION = "➕ 신규 종목 직접 입력"
 
 
+def current_market() -> str:
+    return normalize_market(st.session_state.get("active_market") or MARKET_DOMESTIC)
+
+
 def menu_market(menu: str) -> str | None:
-    """active_menu → domestic|overseas|None(이자)."""
-    if menu.startswith("domestic_"):
-        return MARKET_DOMESTIC
-    if menu.startswith("overseas_"):
-        return MARKET_OVERSEAS
+    """작업 메뉴는 시장 스위치 값을 쓰고, 이자·배당은 시장이 없다."""
+    if menu in MARKET_MENU_KEYS:
+        return current_market()
     return None
 
 
-def menu_action(menu: str) -> str:
-    if menu.startswith("domestic_"):
-        return menu[len("domestic_") :]
-    if menu.startswith("overseas_"):
-        return menu[len("overseas_") :]
-    return menu
+def _legacy_market_hint(raw: str) -> str | None:
+    text = str(raw or "")
+    lowered = text.lower()
+    if "overseas" in lowered or "해외" in text:
+        return MARKET_OVERSEAS
+    if "domestic" in lowered or "국내" in text:
+        return MARKET_DOMESTIC
+    return None
 
 
 def market_label(market: str) -> str:
@@ -938,7 +965,7 @@ def sync_url_params() -> None:
         st.query_params["business_id"] = desired_biz
 
     # menu
-    menu = str(st.session_state.get("active_menu") or "domestic_dashboard")
+    menu = str(st.session_state.get("active_menu") or DEFAULT_MENU)
     if menu in ALL_MENU_KEYS and str(st.query_params.get("menu", "") or "") != menu:
         st.query_params["menu"] = menu
 
@@ -982,6 +1009,9 @@ def _restore_menu_from_query() -> str | None:
     raw = str(st.query_params.get("menu", "") or "").strip()
     if not raw:
         return None
+    hint = _legacy_market_hint(raw)
+    if hint:
+        st.session_state.active_market = hint
     mapped = _LEGACY_TO_MENU.get(raw, raw)
     if mapped in ALL_MENU_KEYS:
         return mapped
@@ -1022,16 +1052,18 @@ def consume_stock_click_query() -> None:
     kept_menu = menu
     kept_market_type = str(st.query_params.get("market_type", "") or "").strip()
 
-    if menu in ALL_MENU_KEYS:
-        st.session_state.active_menu = menu
+    mapped_menu = _LEGACY_TO_MENU.get(menu, menu)
+    hint = _legacy_market_hint(menu)
+    if hint:
+        st.session_state.active_market = hint
+    if mapped_menu in ALL_MENU_KEYS:
+        st.session_state.active_menu = mapped_menu
+        kept_menu = mapped_menu
     elif market_raw:
         mkt = normalize_market(market_raw)
-        st.session_state.active_menu = (
-            "overseas_dashboard"
-            if mkt == MARKET_OVERSEAS
-            else "domestic_dashboard"
-        )
+        st.session_state.active_menu = "ledger"
         st.session_state.active_market = mkt
+        kept_menu = "ledger"
     elif st.session_state.get("active_menu") not in ALL_MENU_KEYS:
         pass
 
@@ -1073,64 +1105,60 @@ def init_session_state() -> None:
     if "active_business_id" not in st.session_state:
         st.session_state.active_business_id = None
 
-    if "active_menu" not in st.session_state:
-        # 1순위: URL ?menu= (F5 복원)
-        from_query = _restore_menu_from_query()
-        if from_query:
-            st.session_state.active_menu = from_query
-        else:
-            candidates = [
-                st.session_state.get("active_menu"),
-                st.session_state.get("stock_sub_menu"),
-                st.session_state.get("interest_sub_menu"),
-                st.session_state.get("stock_sub_page"),
-                st.session_state.get("income_sub_page"),
-                st.session_state.get("active_page"),
-                st.session_state.get("main_category_radio"),
-                st.session_state.get("main_menu"),
-            ]
-            resolved = "domestic_dashboard"
-            for raw in candidates:
-                if raw is None:
-                    continue
-                mapped = _LEGACY_TO_MENU.get(str(raw))
-                if mapped in ALL_MENU_KEYS:
-                    resolved = mapped
-                    break
-                if str(raw) in ALL_MENU_KEYS:
-                    resolved = str(raw)
-                    break
-                if "이자" in str(raw) or "배당" in str(raw):
-                    resolved = "interest_list"
-                    break
-                if "해외" in str(raw):
-                    resolved = "overseas_dashboard"
-                    break
-            st.session_state.active_menu = resolved
+    from_query = _restore_menu_from_query()
+    if from_query:
+        st.session_state.active_menu = from_query
+    elif "active_menu" not in st.session_state:
+        # URL이 없을 때만 옛 세션 키를 새 메뉴로 옮긴다.
+        candidates = [
+            st.session_state.get("stock_sub_menu"),
+            st.session_state.get("interest_sub_menu"),
+            st.session_state.get("stock_sub_page"),
+            st.session_state.get("income_sub_page"),
+            st.session_state.get("active_page"),
+            st.session_state.get("main_category_radio"),
+            st.session_state.get("main_menu"),
+        ]
+        resolved = DEFAULT_MENU
+        for raw in candidates:
+            if raw is None:
+                continue
+            hint = _legacy_market_hint(str(raw))
+            if hint:
+                st.session_state.active_market = hint
+            mapped = _LEGACY_TO_MENU.get(str(raw))
+            if mapped in ALL_MENU_KEYS:
+                resolved = mapped
+                break
+            if str(raw) in ALL_MENU_KEYS:
+                resolved = str(raw)
+                break
+            if "이자" in str(raw) or "배당" in str(raw):
+                resolved = "income"
+                break
+            if "해외" in str(raw):
+                resolved = DEFAULT_MENU
+                st.session_state.active_market = MARKET_OVERSEAS
+                break
+        st.session_state.active_menu = resolved
 
     cur = st.session_state.get("active_menu")
     if cur in _LEGACY_TO_MENU:
+        hint = _legacy_market_hint(str(cur))
+        if hint:
+            st.session_state.active_market = hint
         st.session_state.active_menu = _LEGACY_TO_MENU[cur]
     if st.session_state.get("active_menu") not in ALL_MENU_KEYS:
-        st.session_state.active_menu = "domestic_dashboard"
+        st.session_state.active_menu = DEFAULT_MENU
 
     st.session_state.active_category = (
-        "domestic"
-        if st.session_state.active_menu in DOMESTIC_MENU_KEYS
-        else (
-            "overseas"
-            if st.session_state.active_menu in OVERSEAS_MENU_KEYS
-            else "interest"
-        )
+        "income" if st.session_state.active_menu == "income" else "work"
     )
-    # 시장 키: 메뉴 우선, 없으면 URL market_type 복원
-    mkt = menu_market(st.session_state.active_menu)
-    if mkt:
-        st.session_state.active_market = mkt
+    from_mkt = _restore_market_from_query()
+    if from_mkt:
+        st.session_state.active_market = from_mkt
     elif "active_market" not in st.session_state:
-        from_mkt = _restore_market_from_query()
-        if from_mkt:
-            st.session_state.active_market = from_mkt
+        st.session_state.active_market = MARKET_DOMESTIC
 
     # 호환 키 (프롬프트의 market_type)
     if st.session_state.get("active_market"):
@@ -1264,6 +1292,22 @@ def manage_business_modal(
         except Exception as exc:  # noqa: BLE001
             st.error(str(exc))
 
+    st.divider()
+    st.subheader("거래 삭제")
+    trade_n = len(db.list_trades(business_id=int(selected_id)))
+    st.caption(
+        f"매매 거래만 지웁니다. 종목·증권사 마스터와 이자·배당은 남습니다. "
+        f"지금 {trade_n:,}건."
+    )
+    if st.button(
+        "선택 사업자 거래 삭제",
+        use_container_width=True,
+        type="secondary",
+        key="manage_biz_clear_trades",
+        disabled=trade_n == 0,
+    ):
+        confirm_clear_business_trades_dialog(db, int(selected_id), current_name)
+
 
 def sidebar_business_selector(storage: Storage) -> int | None:
     businesses = storage.list_businesses()
@@ -1345,16 +1389,12 @@ def sidebar_business_selector(storage: Storage) -> int | None:
             use_container_width=True,
             disabled=not can_manage,
             key="sidebar_manage_biz",
-            help="사업자 명칭 수정·삭제" if can_manage else "사업자를 먼저 추가하세요",
+            help="사업자 수정·삭제, 거래 삭제" if can_manage else "사업자를 먼저 추가하세요",
         ):
             manage_business_modal(storage, current_biz_id=selected_id)
 
     # URL과 세션 최종 동기화 (콜백 외 경로·최초 진입 포함)
     sync_business_to_query(selected_id)
-
-    # 사업자 바로 아래 — 스크롤 없이 보이도록
-    sidebar_data_management(storage, selected_id)
-
     return selected_id
 
 
@@ -1405,58 +1445,26 @@ def confirm_clear_business_trades_dialog(
                 st.error(str(exc))
 
 
-def sidebar_data_management(
-    storage: Storage,
-    business_id: int | None,
-) -> None:
-    """사이드바 데이터 관리 — 선택 사업자 거래 삭제."""
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("데이터 관리")
-    if business_id is None:
-        st.sidebar.caption("사업자를 선택하면 해당 사업자의 거래만 삭제할 수 있습니다.")
-        st.sidebar.button(
-            "🗑️ 선택 사업자 거래 삭제",
-            use_container_width=True,
-            disabled=True,
-            key="sidebar_clear_trades_disabled",
-            help="사이드바에서 사업자를 먼저 선택하세요 (전체 제외)",
-        )
-        return
-
-    biz_name = next(
-        (b.name for b in storage.list_businesses() if b.id == business_id),
-        str(business_id),
-    )
-    trade_n = len(storage.list_trades(business_id=business_id))
-    st.sidebar.caption(f"대상: **{biz_name}** · 거래 {trade_n:,}건")
-    if st.sidebar.button(
-        "🗑️ 선택 사업자 거래 삭제",
-        use_container_width=True,
-        type="secondary",
-        key="sidebar_clear_trades",
-        help="선택한 사업자의 매매 거래만 삭제합니다",
-    ):
-        confirm_clear_business_trades_dialog(storage, int(business_id), biz_name)
-
-
 def _activate_menu(menu_key: str) -> None:
     st.session_state.active_menu = menu_key
-    if menu_key in DOMESTIC_MENU_KEYS:
-        st.session_state.active_category = "domestic"
-        st.session_state.active_market = MARKET_DOMESTIC
-    elif menu_key in OVERSEAS_MENU_KEYS:
-        st.session_state.active_category = "overseas"
-        st.session_state.active_market = MARKET_OVERSEAS
-    else:
-        st.session_state.active_category = "interest"
+    st.session_state.active_category = "income" if menu_key == "income" else "work"
     st.session_state.market_type = _market_type_param(
         st.session_state.get("active_market")
     )
     sync_url_params()
 
 
+def _on_sidebar_market_change() -> None:
+    label = str(st.session_state.get("sidebar_market") or "국내주식")
+    st.session_state.active_market = (
+        MARKET_OVERSEAS if label == "해외주식" else MARKET_DOMESTIC
+    )
+    st.session_state.market_type = _market_type_param(st.session_state.active_market)
+    sync_url_params()
+
+
 def _sidebar_nav_button(label: str, menu_key: str) -> None:
-    """트리형 하위 메뉴 버튼. 현재 선택 항목은 primary로 강조."""
+    """작업 순서 메뉴 버튼. 현재 선택은 primary."""
     is_active = st.session_state.get("active_menu") == menu_key
     st.button(
         label,
@@ -1468,39 +1476,61 @@ def _sidebar_nav_button(label: str, menu_key: str) -> None:
     )
 
 
+def render_step_guide(menu: str) -> None:
+    """페이지 상단: 지금 단계 + 다음 메뉴로 가는 버튼."""
+    guide = STEP_GUIDES.get(menu)
+    if not guide:
+        return
+    title, body, next_key, next_label = guide
+    left, right = st.columns([4, 1])
+    with left:
+        st.info(f"**{title}** — {body}")
+    with right:
+        if next_key in ALL_MENU_KEYS:
+            st.button(
+                next_label,
+                use_container_width=True,
+                key=f"guide_next_{menu}",
+                on_click=_activate_menu,
+                args=(next_key,),
+            )
+
+
 def sidebar_tree_menu() -> str:
-    """대메뉴 expander + 하위 버튼 트리. active_menu 키를 반환."""
-    menu = st.session_state.get("active_menu", "domestic_dashboard")
-    cat = st.session_state.get("active_category")
-    if cat not in {"domestic", "overseas", "interest"}:
-        cat = (
-            "domestic"
-            if menu in DOMESTIC_MENU_KEYS
-            else ("overseas" if menu in OVERSEAS_MENU_KEYS else "interest")
+    """시장 스위치 + 번호 작업 메뉴."""
+    menu = st.session_state.get("active_menu", DEFAULT_MENU)
+    show_market = menu in MARKET_MENU_KEYS
+
+    if "sidebar_market" not in st.session_state:
+        mkt = current_market()
+        st.session_state.sidebar_market = (
+            "해외주식" if mkt == MARKET_OVERSEAS else "국내주식"
         )
+    elif show_market:
+        want = "해외주식" if current_market() == MARKET_OVERSEAS else "국내주식"
+        if st.session_state.sidebar_market != want:
+            st.session_state.sidebar_market = want
 
-    with st.sidebar.expander(
-        "📈 국내주식 매매일지·잔고 관리",
-        expanded=(cat == "domestic"),
-    ):
-        for key, label in DOMESTIC_MENU_ITEMS:
+    if show_market:
+        st.sidebar.radio(
+            "시장",
+            ["국내주식", "해외주식"],
+            horizontal=True,
+            key="sidebar_market",
+            on_change=_on_sidebar_market_change,
+        )
+    else:
+        st.sidebar.caption("이자·배당은 시장 구분이 없습니다.")
+
+    with st.sidebar.expander("작업 순서", expanded=True):
+        for key, label in WORK_MENU_ITEMS:
             _sidebar_nav_button(label, key)
 
-    with st.sidebar.expander(
-        "🌎 해외주식 매매일지·잔고 관리",
-        expanded=(cat == "overseas"),
-    ):
-        for key, label in OVERSEAS_MENU_ITEMS:
+    with st.sidebar.expander("그 외", expanded=(menu in {"income", "codes"})):
+        for key, label in EXTRA_MENU_ITEMS:
             _sidebar_nav_button(label, key)
 
-    with st.sidebar.expander(
-        "💰 이자·배당소득 관리",
-        expanded=(cat == "interest"),
-    ):
-        for key, label in INCOME_MENU_ITEMS:
-            _sidebar_nav_button(label, key)
-
-    return st.session_state.get("active_menu", "domestic_dashboard")
+    return st.session_state.get("active_menu", DEFAULT_MENU)
 
 
 def route_active_menu(
@@ -1509,34 +1539,63 @@ def route_active_menu(
     menu: str,
 ) -> None:
     """active_menu 키에 따라 본문 페이지 렌더."""
-    market = menu_market(menu)
-    action = menu_action(menu)
-
-    if market is not None:
-        if action == "dashboard":
-            page_dashboard(storage, business_id, market=market)
-        elif action == "trade_input":
-            page_trades(storage, business_id, market=market)
-        elif action == "import_export":
-            page_import_export(storage, market=market)
-        elif action == "converter":
-            page_broker(storage, market=market)
-        elif action == "base_data":
-            page_legacy_journal(storage, business_id, market=market)
-        elif action == "stock_masters":
-            page_masters(storage, business_id, market=market)
-        elif action == "stock_settings":
-            page_settings(storage, business_id, mode="stock", market=market)
-        else:
-            page_dashboard(storage, business_id, market=market)
-        return
-
-    if action == "interest_list":
+    market = menu_market(menu) or current_market()
+    if menu == "setup":
+        page_masters(storage, business_id, market=market)
+    elif menu == "ingest":
+        page_ingest(storage, business_id, market=market)
+    elif menu == "ledger":
+        page_dashboard(storage, business_id, market=market)
+    elif menu == "voucher":
+        page_voucher(storage, market=market)
+    elif menu == "income":
         page_income(storage, business_id)
-    elif action == "interest_settings":
+    elif menu == "codes":
+        page_codes(storage, business_id)
+    else:
+        page_dashboard(storage, business_id, market=market)
+
+
+def page_ingest(
+    storage: Storage,
+    business_id: int | None,
+    market: str = MARKET_DOMESTIC,
+) -> None:
+    """증권사 파일 / 표준 엑셀 / 예전 매매일지 / 직접 입력."""
+    market = normalize_market(market)
+    render_step_guide("ingest")
+    st.caption(f"시장: **{market_label(market)}**")
+    tab_broker, tab_std, tab_legacy, tab_manual = st.tabs(
+        ["증권사 파일", "표준 엑셀", "예전 매매일지", "직접 입력"]
+    )
+    with tab_broker:
+        st.caption(
+            "키움·미래에셋·DB금융·한투 CSV/Excel/PDF, 해외는 미래에셋 PDF·KB 엑셀."
+        )
+        page_broker(storage, market=market)
+    with tab_std:
+        st.caption("필수 컬럼: 거래일자, 종목코드, 거래유형, 수량, 단가.")
+        page_standard_import(storage, market=market)
+    with tab_legacy:
+        st.caption("시트별 '주식 매매일지'로 만들어 둔 예전 엑셀.")
+        page_legacy_journal(storage, business_id, market=market)
+    with tab_manual:
+        st.caption("한 건씩 매수·매도를 직접 넣습니다.")
+        page_trades(storage, business_id, market=market)
+
+
+def page_codes(storage: Storage, business_id: int | None) -> None:
+    render_step_guide("codes")
+    kind = st.radio(
+        "대상",
+        ["주식 매매", "이자·배당"],
+        horizontal=True,
+        key="codes_kind",
+    )
+    if kind == "이자·배당":
         page_settings(storage, business_id, mode="income")
     else:
-        page_dashboard(storage, business_id, market=MARKET_DOMESTIC)
+        page_settings(storage, business_id, mode="stock", market=current_market())
 
 
 def page_dashboard(
@@ -1545,6 +1604,7 @@ def page_dashboard(
     market: str = MARKET_DOMESTIC,
 ) -> None:
     market = normalize_market(market)
+    render_step_guide("ledger")
     st.caption(f"시장: **{market_label(market)}** · FIFO 잔고는 증권사별로 분리됩니다.")
 
     accounts = (
@@ -2224,9 +2284,19 @@ def page_import_export(
     storage: Storage,
     market: str = MARKET_DOMESTIC,
 ) -> None:
+    page_voucher(storage, market=market)
+    st.divider()
+    page_standard_import(storage, market=market)
+
+
+def page_voucher(
+    storage: Storage,
+    market: str = MARKET_DOMESTIC,
+) -> None:
     market = normalize_market(market)
+    render_step_guide("voucher")
     st.caption(f"시장: **{market_label(market)}**")
-    st.subheader("Export")
+    st.subheader("회계 전표")
     business_id = st.session_state.get("active_business_id")
     trades = storage.list_trades(business_id=business_id, market=market)
     positions, sells, _ = compute_positions(trades)
@@ -2380,7 +2450,12 @@ def page_import_export(
             use_container_width=True,
         )
 
-    st.divider()
+
+def page_standard_import(
+    storage: Storage,
+    market: str = MARKET_DOMESTIC,
+) -> None:
+    market = normalize_market(market)
     st.subheader("표준 양식 Import (CSV/Excel)")
     st.caption(
         "필수 컬럼: 거래일자, 종목코드, 거래유형, 수량, 단가 / "
@@ -3135,9 +3210,9 @@ def page_masters(
     market: str = MARKET_DOMESTIC,
 ) -> None:
     market = normalize_market(market)
+    render_step_guide("setup")
     st.caption(f"시장: **{market_label(market)}**")
-    """선택한 사업자 소속 종목·증권사/계좌만 관리."""
-    st.subheader("🏢 거래처 및 종목 관리")
+    st.subheader("종목 · 증권사/계좌")
     if business_id is None:
         st.warning("사이드바에서 사업자를 선택한 뒤 종목·거래처를 관리해 주세요.")
         return
@@ -3304,7 +3379,7 @@ def page_masters(
                     except Exception as exc:  # noqa: BLE001
                         st.error(str(exc))
         else:
-            st.info("등록된 거래처가 없습니다.")
+            st.info("등록된 거래처가 없습니다. 아래에서 증권사를 만들면 미지정 거래를 옮길 수 있습니다.")
 
         unassigned = next(
             (a for a in accounts if a.name == UNASSIGNED_ACCOUNT_NAME and a.id),
@@ -3694,10 +3769,11 @@ def confirm_clear_income_records_dialog(
 
 
 def page_income(storage: Storage, business_id: int | None) -> None:
-    """이자·배당소득 업로드 · 조회 · 전표 다운로드 (설정은 환경설정 메뉴)."""
+    """이자·배당소득 업로드 · 조회 · 전표 다운로드."""
+    render_step_guide("income")
     st.caption(
-        "원천징수영수증 업로드 및 전표 생성/엑셀 다운로드. "
-        "계정과목·증권사 거래처코드는 ⚙️ 환경설정에서 관리합니다."
+        "원천징수영수증 업로드 및 전표 생성. "
+        "계정과목·증권사 거래처코드는 계정코드 메뉴에서 관리합니다."
     )
 
     if business_id is None:
@@ -4103,7 +4179,7 @@ def main() -> None:
     if pending_toast:
         st.toast(pending_toast)
 
-    # 사이드바: 사업자(+데이터 관리) → 트리형 메뉴
+    # 사이드바: 사업자 → 시장 → 작업 순서
     business_id = sidebar_business_selector(storage)
     st.sidebar.divider()
     menu = sidebar_tree_menu()
@@ -4113,9 +4189,10 @@ def main() -> None:
     # F5 복원용 URL 동기화 (사업자·메뉴·시장)
     sync_url_params()
 
-    title, caption = MENU_PAGE_META.get(
-        menu, MENU_PAGE_META["domestic_dashboard"]
-    )
+    title, caption = MENU_PAGE_META.get(menu, MENU_PAGE_META[DEFAULT_MENU])
+    market = menu_market(menu)
+    if market:
+        title = f"{market_label(market)} · {title}"
     st.title(title)
     st.caption(caption)
     route_active_menu(storage, business_id, menu)
