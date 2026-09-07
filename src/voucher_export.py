@@ -225,7 +225,8 @@ def _buy_lines(
     qty = trade.quantity
     price = trade.price
     stock_name = (trade.stock_name or "").strip()
-    broker_code, broker_name = "", ""
+    broker_code = (getattr(trade, "account_code", "") or "").strip()
+    broker_name = (getattr(trade, "account_name", "") or "").strip()
 
     principal = _won(qty * price)
     fee = _won(trade.fee)
@@ -282,7 +283,8 @@ def _sell_lines(
     qty = trade.quantity
     price = trade.price
     stock_name = (trade.stock_name or "").strip()
-    broker_code, broker_name = "", ""
+    broker_code = (getattr(trade, "account_code", "") or "").strip()
+    broker_name = (getattr(trade, "account_name", "") or "").strip()
 
     lines: list[VoucherLine] = []
     book = 0

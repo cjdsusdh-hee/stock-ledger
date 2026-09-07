@@ -38,6 +38,34 @@ def normalize_currency(value: str | None) -> str:
     return text if text else "USD"
 
 
+def coerce_fx_rate(value: Any) -> float:
+    """환율 값 정규화. 비어 있거나 파싱 불가면 추정하지 않고 0.0.
+
+    공란·None·NaN·'-' 등은 모두 0으로 등록한다.
+    """
+    if value is None:
+        return 0.0
+    try:
+        if isinstance(value, float) and value != value:  # NaN
+            return 0.0
+    except Exception:  # noqa: BLE001
+        pass
+    if isinstance(value, (int, float)):
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return v if v > 0 else 0.0
+    text = str(value).strip().replace(",", "").replace("원", "").replace("₩", "")
+    if not text or text.lower() in {"nan", "none", "null", "-", "."}:
+        return 0.0
+    try:
+        v = float(text)
+    except ValueError:
+        return 0.0
+    return v if v > 0 else 0.0
+
+
 @dataclass
 class Business:
     id: int | None
@@ -104,10 +132,14 @@ class Trade:
     price_fx: float = 0.0  # 외화 단가
     fee_fx: float = 0.0
     tax_fx: float = 0.0
+    # 증권사/계좌
+    account_id: int | None = None
     # join fields (optional)
     business_name: str = ""
     stock_code: str = ""
     stock_name: str = ""
+    account_name: str = ""
+    account_code: str = ""
 
     @property
     def is_overseas(self) -> bool:
@@ -132,6 +164,8 @@ class Lot:
     stock_code: str = ""
     stock_name: str = ""
     business_name: str = ""
+    account_id: int | None = None
+    account_name: str = ""
 
     @property
     def remaining_fee(self) -> float:
@@ -174,11 +208,13 @@ class SellResult:
     stock_code: str = ""
     stock_name: str = ""
     business_name: str = ""
+    account_id: int | None = None
+    account_name: str = ""
 
 
 @dataclass
 class Position:
-    """사업자+종목별 잔고 요약."""
+    """사업자+증권사+종목별 잔고 요약."""
 
     business_id: int
     business_name: str
@@ -190,6 +226,8 @@ class Position:
     total_cost: float
     realized_pnl: float
     lots: list[Lot] = field(default_factory=list)
+    account_id: int | None = None
+    account_name: str = ""
 
 
 @dataclass

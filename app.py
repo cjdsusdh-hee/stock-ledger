@@ -26,8 +26,10 @@ if str(ROOT) not in sys.path:
 
 from src.brokers import detect_and_parse, list_brokers
 from src.brokers.pdf_parser import OCR_TIP, empty_trade_rows
+from src.dedupe import classify_trades
 from src.fifo import compute_positions
 from src.legacy_journal import parse_legacy_journal_excel
+from src.storage import UNASSIGNED_ACCOUNT_NAME
 
 # Streamlit 핫리로드 시 stale sys.modules 방지
 import importlib
@@ -54,12 +56,15 @@ MARKET_OVERSEAS = _models_mod.MARKET_OVERSEAS
 FX_CURRENCIES = _models_mod.FX_CURRENCIES
 normalize_market = _models_mod.normalize_market
 normalize_currency = _models_mod.normalize_currency
+coerce_fx_rate = _models_mod.coerce_fx_rate
 now_str = _models_mod.now_str
 Storage = _storage_mod.Storage
 export_voucher_excel_bytes = _voucher_mod.export_voucher_excel_bytes
 trades_to_voucher_lines = _voucher_mod.trades_to_voucher_lines
 parse_income_file = _income_parser_mod.parse_income_file
 rows_to_dataframe = _income_parser_mod.rows_to_dataframe
+apply_income_fx_rates = _income_parser_mod.apply_income_fx_rates
+ensure_income_preview_columns = _income_parser_mod.ensure_income_preview_columns
 export_income_voucher_excel_bytes = _income_voucher_mod.export_income_voucher_excel_bytes
 income_to_voucher_lines = _income_voucher_mod.income_to_voucher_lines
 dataframe_to_trades = _import_export_mod.dataframe_to_trades
@@ -160,7 +165,7 @@ def inject_sidebar_styles() -> None:
     st.markdown(SIDEBAR_CUSTOM_CSS, unsafe_allow_html=True)
 
 
-STORAGE_CACHE_VERSION = 18  # Storage API 변경 시 증가 → 캐시 무효화
+STORAGE_CACHE_VERSION = 21  # Storage API 변경 시 증가 → 캐시 무효화
 
 
 @st.cache_resource
@@ -173,11 +178,18 @@ def _storage_singleton(_version: int) -> object:
 
     importlib.reload(models_mod)
     storage_mod = importlib.reload(storage_mod)
-    return storage_mod.Storage()
+    instance = storage_mod.Storage()
+    try:
+        ok, _ = instance.probe_account_column()
+        if ok:
+            instance.backfill_unassigned_accounts()
+    except Exception:  # noqa: BLE001
+        pass
+    return instance
 
 
 def get_storage() -> Storage:
-    """SQLite Storage. 핫리로드로 모델/메서드가 어긋나면 강제 갱신한다."""
+    """Supabase Storage. 핫리로드로 모델/메서드가 어긋나면 강제 갱신한다."""
     import importlib
     import inspect
     import types
@@ -201,6 +213,11 @@ def get_storage() -> Storage:
         "get_income_records_by_period",
         "list_broker_partners",
         "clear_trades_for_business",
+        "clear_income_records_for_business",
+        "get_or_create_account",
+        "count_trades_for_account",
+        "probe_account_column",
+        "backfill_unassigned_accounts",
     )
     biz_ok = True
     stocks_ok = False
@@ -209,7 +226,12 @@ def get_storage() -> Storage:
         from dataclasses import fields as dc_fields
 
         biz_fields = {f.name for f in dc_fields(models_mod.Business)}
-        biz_ok = "code" in biz_fields and "account_no" in biz_fields
+        trade_fields = {f.name for f in dc_fields(models_mod.Trade)}
+        biz_ok = (
+            "code" in biz_fields
+            and "account_no" in biz_fields
+            and "account_id" in trade_fields
+        )
     except Exception:  # noqa: BLE001
         biz_ok = False
 
@@ -218,7 +240,7 @@ def get_storage() -> Storage:
         sig = inspect.signature(type(storage).get_all_stocks)
         stocks_ok = "business_id" in sig.parameters and "market" in sig.parameters
         lt = inspect.signature(type(storage).list_trades)
-        stocks_ok = stocks_ok and "market" in lt.parameters
+        stocks_ok = stocks_ok and "market" in lt.parameters and "account_id" in lt.parameters
         ac = inspect.signature(type(storage).get_account_config)
         stocks_ok = stocks_ok and "market" in ac.parameters
     except Exception:  # noqa: BLE001
@@ -251,6 +273,81 @@ def get_storage() -> Storage:
 
 def money(v: float) -> str:
     return f"{v:,.0f}"
+
+
+def select_trade_account(
+    storage: Storage,
+    business_id: int,
+    market: str,
+    *,
+    key: str,
+    detected_name: str = "",
+    help_text: str = "거래가 속할 증권사/계좌. FIFO 잔고는 증권사별로 분리됩니다.",
+):
+    """증권사 선택. 없으면 신규 생성."""
+    accounts = storage.list_accounts(business_id, market=market)
+    names = [a.name for a in accounts]
+    create_opt = "➕ 증권사 직접 입력"
+    options = [*names, create_opt] if names else [create_opt]
+    default_idx = 0
+    detected = (detected_name or "").strip()
+    if detected and detected in names:
+        default_idx = names.index(detected)
+    elif detected:
+        default_idx = options.index(create_opt)
+    choice = st.selectbox(
+        "증권사/계좌",
+        options,
+        index=min(default_idx, len(options) - 1),
+        key=key,
+        help=help_text,
+    )
+    if choice == create_opt:
+        new_name = st.text_input(
+            "증권사명",
+            value=detected,
+            key=f"{key}_new_name",
+            placeholder="예: 키움증권",
+        ).strip()
+        if not new_name:
+            return None
+        return storage.get_or_create_account(
+            int(business_id), new_name, market=market
+        )
+    return next((a for a in accounts if a.name == choice), None)
+
+
+def render_dedupe_controls(prefix: str) -> bool:
+    """중복 제외가 기본. True면 중복도 강제 등록."""
+    st.caption("같은 증권사·일자·종목·수량·단가·수수료는 중복으로 봅니다.")
+    return st.checkbox(
+        "중복 거래도 강제 등록",
+        value=False,
+        key=f"{prefix}_force_dup",
+        help="기본은 신규만 등록합니다. 같은 행을 한 번 더 넣을 때만 선택하세요.",
+    )
+
+
+def save_trades_with_dedupe(
+    storage: Storage,
+    trades: list,
+    *,
+    market: str,
+    force_duplicates: bool,
+) -> tuple[int, int, int]:
+    """신규 등록 건수, DB중복, 파일내부중복."""
+    if not trades:
+        return 0, 0, 0
+    existing = storage.list_trades(
+        business_id=trades[0].business_id,
+        market=market,
+        account_id=getattr(trades[0], "account_id", None),
+    )
+    classified = classify_trades(trades, existing)
+    to_save = list(trades) if force_duplicates else classified.fresh
+    if to_save:
+        storage.add_trades_bulk(to_save)
+    return len(to_save), classified.db_dup_count, classified.file_dup_count
 
 
 def trade_table_column_config() -> dict:
@@ -600,9 +697,11 @@ def _render_holdings_html_table(
             f'<a href="{html.escape(href)}" target="_self">'
             f"{html.escape(stock or '-')}</a>"
         )
+        broker = str(row.get("증권사", "")).strip()
         rows.append(
             "<tr>"
             f"<td class='stock'>{stock_link}</td>"
+            f"<td>{html.escape(broker or '-')}</td>"
             f"<td class='num'>{qty:,.0f} 주</td>"
             f"<td class='num'>{cost:,.0f} 원</td>"
             f"<td class='num'>{pnl:,.0f} 원</td>"
@@ -612,6 +711,7 @@ def _render_holdings_html_table(
     footer = (
         "<tr class='total'>"
         "<td>합계</td>"
+        "<td></td>"
         f"<td class='num'>{sum_qty:,.0f} 주</td>"
         f"<td class='num'>{sum_cost:,.0f} 원</td>"
         f"<td class='num'>{sum_pnl:,.0f} 원</td>"
@@ -672,6 +772,7 @@ def _render_holdings_html_table(
         <thead>
           <tr>
             <th>종목명</th>
+            <th>증권사</th>
             <th>잔여수량</th>
             <th>원가잔액</th>
             <th>누적실현손익</th>
@@ -693,8 +794,11 @@ def refresh_fifo(
     storage: Storage,
     business_id: int | None = None,
     market: str | None = None,
+    account_id: int | None = None,
 ):
-    trades = storage.list_trades(business_id=business_id, market=market)
+    trades = storage.list_trades(
+        business_id=business_id, market=market, account_id=account_id
+    )
     return compute_positions(trades), trades
 
 
@@ -1441,49 +1545,138 @@ def page_dashboard(
     market: str = MARKET_DOMESTIC,
 ) -> None:
     market = normalize_market(market)
-    st.caption(f"시장: **{market_label(market)}**")
-    (positions, _sells, _warnings), trades = refresh_fifo(
-        storage, business_id, market=market
+    st.caption(f"시장: **{market_label(market)}** · FIFO 잔고는 증권사별로 분리됩니다.")
+
+    accounts = (
+        storage.list_accounts(business_id, market=market) if business_id is not None else []
+    )
+    acc_labels = ["전체 증권사", *[a.name for a in accounts if a.name]]
+    picked = st.selectbox(
+        "증권사 필터",
+        acc_labels,
+        key=f"dash_account_{market}_{business_id}",
+    )
+    account_id = None
+    if picked != "전체 증권사":
+        account_id = next(
+            (int(a.id) for a in accounts if a.name == picked and a.id is not None),
+            None,
+        )
+
+    today = date.today()
+    pkey = f"dash_{market}_{business_id}"
+    if f"{pkey}_start" not in st.session_state:
+        st.session_state[f"{pkey}_start"] = date(today.year, 1, 1)
+    if f"{pkey}_end" not in st.session_state:
+        st.session_state[f"{pkey}_end"] = today
+
+    qb1, qb2, qb3 = st.columns(3)
+    if qb1.button("이번 달", use_container_width=True, key=f"{pkey}_m"):
+        st.session_state[f"{pkey}_start"] = date(today.year, today.month, 1)
+        st.session_state[f"{pkey}_end"] = today
+        st.rerun()
+    if qb2.button("올해 (1월~현재)", use_container_width=True, key=f"{pkey}_y"):
+        st.session_state[f"{pkey}_start"] = date(today.year, 1, 1)
+        st.session_state[f"{pkey}_end"] = today
+        st.rerun()
+    if qb3.button("전체 기간", use_container_width=True, key=f"{pkey}_a"):
+        st.session_state[f"{pkey}_start"] = date(2020, 1, 1)
+        st.session_state[f"{pkey}_end"] = today
+        st.rerun()
+
+    d1, d2 = st.columns(2)
+    with d1:
+        start_date = st.date_input(
+            "처분손익 시작일", format="YYYY-MM-DD", key=f"{pkey}_start"
+        )
+    with d2:
+        end_date = st.date_input(
+            "처분손익 종료일", format="YYYY-MM-DD", key=f"{pkey}_end"
+        )
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+
+    (positions, sells, warnings), trades = refresh_fifo(
+        storage, business_id, market=market, account_id=account_id
     )
 
-    # 종목명 링크(?stock=...) 클릭 → 상세 모달
     _open_stock_detail_from_query(storage, trades)
+
+    start_s = start_date.isoformat()
+    end_s = end_date.isoformat()
+    period_sells = [
+        s for s in sells if start_s <= str(s.trade_date)[:10] <= end_s
+    ]
+    period_trades = [
+        t for t in trades if start_s <= str(t.trade_date)[:10] <= end_s
+    ]
 
     held = [p for p in positions if p.quantity > 1e-12]
     total_cost = sum(p.total_cost for p in held)
     total_realized = sum(p.realized_pnl for p in positions)
+    period_pnl = sum(s.realized_pnl for s in period_sells)
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("거래 건수", f"{len(trades):,}")
     c2.metric("보유 종목 수", f"{len(held):,}")
-    c3.metric("잔고 원가합", money(total_cost))
-    c4.metric("누적 실현손익", money(total_realized))
+    c3.metric("원가잔액", money(total_cost))
+    c4.metric("기간 처분손익", money(period_pnl))
+    c5.metric("누적 실현손익", money(total_realized))
+    st.caption(
+        f"기간 처분손익: {start_s} ~ {end_s} 매도 {len(period_sells)}건 "
+        f"/ 기간 거래 {len(period_trades)}건. 원가잔액은 전체 이력 FIFO."
+    )
+    if warnings:
+        with st.expander(f"FIFO 경고 {len(warnings)}건"):
+            for w in warnings:
+                st.warning(w)
 
     st.subheader("보유 잔고")
-    st.caption("💡 종목명을 클릭하면 상세 매매 내역 팝업이 열립니다.")
+    st.caption("종목명을 클릭하면 상세 매매 내역이 열립니다. 같은 종목이어도 증권사가 다르면 행이 분리됩니다.")
 
     pos_df = positions_to_dataframe(positions)
     if pos_df.empty:
         st.info("보유 잔고가 없습니다.")
+    else:
+        pos_df = pos_df.drop(columns=["종목코드", "평단가"], errors="ignore").reset_index(
+            drop=True
+        )
+        for col in ("잔여수량", "원가잔액", "누적실현손익"):
+            if col in pos_df.columns:
+                pos_df[col] = pd.to_numeric(pos_df[col], errors="coerce")
+        if "원가잔액" in pos_df.columns:
+            pos_df["원가잔액"] = pos_df["원가잔액"].round(0)
+        if "누적실현손익" in pos_df.columns:
+            pos_df["누적실현손익"] = pos_df["누적실현손익"].round(0)
+        if "잔여수량" in pos_df.columns:
+            pos_df["잔여수량"] = pos_df["잔여수량"].round(0)
+
+        _render_holdings_html_table(
+            pos_df,
+            active_menu=st.session_state.get("active_menu"),
+            market=market,
+        )
+
+    st.subheader("처분손익")
+    sell_df = sell_results_to_dataframe(period_sells)
+    if sell_df.empty:
+        st.info("선택한 기간의 매도(처분) 내역이 없습니다.")
         return
-
-    pos_df = pos_df.drop(columns=["종목코드", "평단가"], errors="ignore").reset_index(
-        drop=True
-    )
-    for col in ("잔여수량", "원가잔액", "누적실현손익"):
-        if col in pos_df.columns:
-            pos_df[col] = pd.to_numeric(pos_df[col], errors="coerce")
-    if "원가잔액" in pos_df.columns:
-        pos_df["원가잔액"] = pos_df["원가잔액"].round(0)
-    if "누적실현손익" in pos_df.columns:
-        pos_df["누적실현손익"] = pos_df["누적실현손익"].round(0)
-    if "잔여수량" in pos_df.columns:
-        pos_df["잔여수량"] = pos_df["잔여수량"].round(0)
-
-    _render_holdings_html_table(
-        pos_df,
-        active_menu=st.session_state.get("active_menu"),
-        market=market,
+    for col in ("매도수량", "매도단가", "매도금액", "FIFO원가", "수수료", "실현손익"):
+        if col in sell_df.columns:
+            sell_df[col] = pd.to_numeric(sell_df[col], errors="coerce")
+    st.dataframe(
+        sell_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "매도수량": st.column_config.NumberColumn("매도수량", format="%,.4f"),
+            "매도단가": st.column_config.NumberColumn("매도단가", format="%,d 원"),
+            "매도금액": st.column_config.NumberColumn("매도금액", format="%,d 원"),
+            "FIFO원가": st.column_config.NumberColumn("FIFO원가", format="%,d 원"),
+            "수수료": st.column_config.NumberColumn("수수료", format="%,d 원"),
+            "실현손익": st.column_config.NumberColumn("실현손익", format="%,d 원"),
+        },
     )
 
 
@@ -1512,6 +1705,12 @@ def render_overseas_trade_input(storage: Storage, business_id: int | None) -> No
 
     business = next(b for b in businesses if b.id == business_id)
     st.markdown(f"**선택된 사업자:** `{business.name}`")
+    account = select_trade_account(
+        storage, int(business_id), MARKET_OVERSEAS, key="ov_trade_account"
+    )
+    if account is None:
+        st.warning("증권사/계좌를 선택하거나 이름을 입력하세요.")
+        return
 
     if st.session_state.pop("_show_ov_trade_toast", False):
         st.toast(st.session_state.pop("_ov_trade_toast_msg", "저장되었습니다."))
@@ -1677,6 +1876,9 @@ def render_overseas_trade_input(storage: Storage, business_id: int | None) -> No
                 price_fx=float(price_fx),
                 fee_fx=float(fee_fx),
                 tax_fx=float(tax_fx),
+                account_id=int(account.id) if account.id is not None else None,
+                account_name=account.name,
+                account_code=account.code,
             )
             storage.add_trade(trade)
             st.session_state["_ov_last_fx"] = float(fx_rate)
@@ -1702,6 +1904,7 @@ def _render_overseas_trade_list(storage: Storage, business_id: int | None) -> No
             {
                 "ID": t.id,
                 "거래일자": t.trade_date,
+                "증권사": getattr(t, "account_name", "") or "",
                 "유형": (
                     "매수"
                     if t.side == "BUY"
@@ -1813,6 +2016,13 @@ def page_trades(
             horizontal=True,
             key="trade_side",
         )
+    account = select_trade_account(
+        storage, int(business.id), market, key="dom_trade_account"
+    )
+    if account is None:
+        st.warning("증권사/계좌를 선택하거나 이름을 입력하세요.")
+        _render_trade_list(storage, business_id, market=market)
+        return
 
     stock_options = [NEW_STOCK_OPTION, *[f"{s.name} ({s.code})" for s in stocks]]
     preferred = st.session_state.get("_preferred_stock")
@@ -1926,6 +2136,9 @@ def page_trades(
                 memo=str(memo or ""),
                 source="manual",
                 created_at=now_str(),
+                account_id=int(account.id) if account.id is not None else None,
+                account_name=account.name,
+                account_code=account.code,
             )
             tid = storage.add_trade(trade)
 
@@ -1975,6 +2188,7 @@ def _render_trade_list(
     preferred = [
         "거래일자",
         "사업자",
+        "증권사",
         "종목코드",
         "종목명",
         "거래유형",
@@ -2178,16 +2392,31 @@ def page_import_export(
         "사업자 컬럼이 없을 때 기본 사업자",
         [b.name for b in businesses] if businesses else ["(먼저 사업자 등록)"],
     )
+    import_account = None
+    if businesses and default_biz and default_biz != "(먼저 사업자 등록)":
+        biz_obj = next((b for b in businesses if b.name == default_biz), None)
+        if biz_obj and biz_obj.id is not None:
+            import_account = select_trade_account(
+                storage,
+                int(biz_obj.id),
+                market,
+                key=f"std_import_account_{market}",
+            )
+    force_dup = render_dedupe_controls(f"std_import_{market}")
     up = st.file_uploader("매매일지 파일 업로드", type=["csv", "xlsx", "xls"], key="std_up")
     if up and businesses:
         if st.button("표준 양식 일괄 등록", type="primary"):
             try:
+                if import_account is None or import_account.id is None:
+                    raise ValueError("증권사/계좌를 선택하세요.")
                 count, errors = import_standard_file(
                     up.getvalue(),
                     up.name,
                     storage,
                     default_business=default_biz,
                     market=market,
+                    account_id=int(import_account.id),
+                    skip_duplicates=not force_dup,
                 )
                 st.success(f"{count}건 등록 완료")
                 if errors:
@@ -2200,15 +2429,18 @@ def page_import_export(
 
 
 def page_broker_overseas(storage: Storage) -> None:
-    """미래에셋 해외주식 거래내역서 PDF → 검수 후 일괄 등록."""
+    """해외주식 증권사 변환기: 미래에셋 PDF · KB증권 엑셀 → 검수 후 일괄 등록."""
+    from src.brokers.kb_overseas import is_kb_overseas_excel, parse_kb_overseas_excel
     from src.brokers.mirae_overseas import (
+        apply_overseas_preview_fx,
+        ensure_overseas_preview_columns,
         mirae_rows_to_preview_df,
         parse_mirae_overseas_pdf,
     )
 
     st.subheader("해외주식 증권사 변환기")
     st.caption(
-        "미래에셋증권 해외주식 거래내역서 PDF(해외주식매수입고·매도출고·배당금외화입금)를 "
+        "미래에셋증권 해외주식 거래내역서 PDF, KB증권 증권계좌거래내역 엑셀을 "
         "파싱한 뒤 검수·수정하여 해외주식 매매일지에 반영합니다."
     )
 
@@ -2227,31 +2459,72 @@ def page_broker_overseas(storage: Storage) -> None:
                 break
 
     biz = st.selectbox("반영할 사업자", biz_names, index=default_idx, key="ov_broker_biz")
+    ov_biz = next((b for b in businesses if b.name == biz), None)
+    ov_account = None
+    if ov_biz and ov_biz.id is not None:
+        detected = ""
+        src = str(st.session_state.get("ov_broker_source") or "")
+        if "kb" in src.lower():
+            detected = "KB증권"
+        elif "mirae" in src.lower() or "미래" in src:
+            detected = "미래에셋증권"
+        ov_account = select_trade_account(
+            storage,
+            int(ov_biz.id),
+            MARKET_OVERSEAS,
+            key="ov_broker_account",
+            detected_name=detected,
+        )
+    force_ov_dup = render_dedupe_controls("ov_broker")
     up = st.file_uploader(
-        "미래에셋 해외주식 거래내역서 PDF",
-        type=["pdf"],
+        "해외주식 거래내역 (PDF / Excel)",
+        type=["pdf", "xlsx", "xls"],
         key="ov_broker_up",
+        help="미래에셋 거래내역서 PDF 또는 KB증권 증권계좌거래내역 엑셀",
     )
 
     if up:
         token = f"{up.name}:{up.size}:{biz}"
         if st.session_state.get("ov_broker_token") != token:
-            result = parse_mirae_overseas_pdf(up.getvalue(), up.name)
+            name = up.name or ""
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            file_bytes = up.getvalue()
+            if ext == "pdf":
+                result = parse_mirae_overseas_pdf(file_bytes, name)
+            elif is_kb_overseas_excel(name):
+                result = parse_kb_overseas_excel(file_bytes, name)
+            else:
+                result = parse_kb_overseas_excel(file_bytes, name)
+                if not (result.get("rows") or []):
+                    result = {
+                        "rows": [],
+                        "notes": [
+                            "지원 형식: 미래에셋 해외주식 PDF, KB증권 증권계좌거래내역 엑셀."
+                        ],
+                        "source": "overseas-unknown",
+                    }
             st.session_state.ov_broker_token = token
             st.session_state.ov_broker_notes = result.get("notes") or []
+            st.session_state.ov_broker_source = result.get("source") or "overseas"
             st.session_state.ov_broker_df = mirae_rows_to_preview_df(
                 result.get("rows") or []
             )
+            st.session_state.pop("ov_broker_editor", None)
 
     for note in st.session_state.get("ov_broker_notes") or []:
         st.info(note)
 
     df = st.session_state.get("ov_broker_df")
     if df is None or getattr(df, "empty", True):
-        st.info("PDF를 업로드하면 파싱 미리보기가 표시됩니다.")
+        st.info("PDF 또는 엑셀을 업로드하면 파싱 미리보기가 표시됩니다.")
         return
 
     st.markdown("### 파싱 미리보기 (검수 및 수정)")
+    st.caption(
+        "적용환율이 0인 행(외화배당 등)은 **적용환율** 칸에 직접 입력하세요. "
+        "입력 즉시 원화단가·거래금액(원)·메모가 재계산됩니다."
+    )
+    df = ensure_overseas_preview_columns(df)
     edited = st.data_editor(
         df,
         num_rows="dynamic",
@@ -2259,6 +2532,7 @@ def page_broker_overseas(storage: Storage) -> None:
         hide_index=True,
         key="ov_broker_editor",
         column_config={
+            "증권사": st.column_config.TextColumn("증권사", width="small"),
             "거래유형": st.column_config.SelectboxColumn(
                 "거래유형",
                 options=["해외매수", "해외매도", "외화배당"],
@@ -2268,10 +2542,49 @@ def page_broker_overseas(storage: Storage) -> None:
             "외화단가": st.column_config.NumberColumn("외화단가", format="%.4f"),
             "외화수수료": st.column_config.NumberColumn("외화수수료", format="%.4f"),
             "외화제세금": st.column_config.NumberColumn("외화제세금", format="%.4f"),
-            "적용환율": st.column_config.NumberColumn("적용환율", format="%.2f"),
+            "적용환율": st.column_config.NumberColumn(
+                "적용환율",
+                format="%.2f",
+                min_value=0.0,
+                step=0.1,
+                help="0이면 직접 입력 → 원화·메모 자동 환산",
+            ),
+            "원화단가": st.column_config.NumberColumn(
+                "원화단가", format="%.0f", help="외화단가 × 적용환율"
+            ),
+            "원화수수료": st.column_config.NumberColumn(
+                "원화수수료", format="%.0f", help="외화수수료 × 적용환율"
+            ),
+            "원화재세금": st.column_config.NumberColumn(
+                "원화재세금", format="%.0f", help="외화제세금 × 적용환율"
+            ),
+            "거래금액(원)": st.column_config.NumberColumn(
+                "거래금액(원)", format="%.0f", help="환율 반영 정산금액"
+            ),
         },
+        disabled=["원화단가", "원화수수료", "원화재세금", "거래금액(원)"],
     )
-    st.session_state.ov_broker_df = edited
+
+    recalced = apply_overseas_preview_fx(edited)
+    fx_changed = False
+    try:
+        prev_fx = pd.to_numeric(df["적용환율"], errors="coerce").fillna(0.0).reset_index(drop=True)
+        new_fx = pd.to_numeric(recalced["적용환율"], errors="coerce").fillna(0.0).reset_index(drop=True)
+        prev_amt = pd.to_numeric(df["거래금액(원)"], errors="coerce").fillna(0.0).reset_index(drop=True)
+        new_amt = pd.to_numeric(recalced["거래금액(원)"], errors="coerce").fillna(0.0).reset_index(drop=True)
+        if len(prev_fx) == len(new_fx) and (
+            not prev_fx.equals(new_fx) or not prev_amt.equals(new_amt)
+        ):
+            fx_changed = True
+    except Exception:  # noqa: BLE001
+        fx_changed = False
+
+    st.session_state.ov_broker_df = recalced
+    if fx_changed:
+        st.session_state.pop("ov_broker_editor", None)
+        st.rerun()
+
+    edited = recalced
 
     if not st.button(
         "선택된 사업자로 해외주식 거래 일괄 등록",
@@ -2284,21 +2597,29 @@ def page_broker_overseas(storage: Storage) -> None:
     try:
         business = storage.get_or_create_business(biz)
         bid = int(business.id)  # type: ignore[arg-type]
+        if ov_account is None or ov_account.id is None:
+            raise ValueError("증권사/계좌를 선택하세요.")
         trades: list = []
         errors: list[str] = []
-        for idx, row in edited.iterrows():
+        to_save = apply_overseas_preview_fx(edited)
+        for idx, row in to_save.iterrows():
             try:
                 ticker = str(row.get("종목코드") or "").strip().upper()
                 name = str(row.get("종목명") or ticker).strip() or ticker
+                if not ticker:
+                    ticker = name[:12].upper() if name else ""
                 if not ticker:
                     raise ValueError("종목코드 없음")
                 qty = float(row.get("수량") or 0)
                 price_fx = float(row.get("외화단가") or 0)
                 fee_fx = float(row.get("외화수수료") or 0)
                 tax_fx = float(row.get("외화제세금") or 0)
-                fx = float(row.get("적용환율") or 0)
+                # 사용자가 입력한 최종 적용환율 (공란 → 0, 추정 없음)
+                fx = coerce_fx_rate(row.get("적용환율"))
                 ccy = normalize_currency(str(row.get("통화코드") or "USD"))
                 kind = str(row.get("거래유형") or "")
+                if "배당" in kind:
+                    continue
                 if kind == "해외매수":
                     side = "BUY"
                 elif kind == "해외매도":
@@ -2307,8 +2628,8 @@ def page_broker_overseas(storage: Storage) -> None:
                     side = "DIVIDEND"
                     if qty <= 0:
                         qty = 1.0
-                if qty <= 0 or price_fx < 0 or fx <= 0:
-                    raise ValueError("수량/단가/환율을 확인하세요.")
+                if qty <= 0 or price_fx < 0:
+                    raise ValueError("수량/단가를 확인하세요.")
 
                 stock = storage.get_or_create_stock(
                     ticker, name, business_id=bid, market=MARKET_OVERSEAS
@@ -2335,26 +2656,50 @@ def page_broker_overseas(storage: Storage) -> None:
                         fee=fee_krw,
                         tax=tax_krw,
                         settlement_amount=settle,
-                        memo=str(row.get("메모") or "mirae-overseas"),
-                        source="broker:mirae-overseas",
+                        memo=str(row.get("메모") or "overseas-broker"),
+                        source=(
+                            "broker:kb-overseas"
+                            if "KB" in str(row.get("증권사") or "").upper()
+                            or "kb" in str(st.session_state.get("ov_broker_source") or "")
+                            else "broker:mirae-overseas"
+                        ),
                         currency=ccy,
                         fx_rate=fx,
                         price_fx=price_fx,
                         fee_fx=fee_fx,
                         tax_fx=tax_fx,
+                        account_id=int(ov_account.id),
+                        account_name=ov_account.name,
+                        account_code=ov_account.code,
                     )
                 )
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"행 {int(idx) + 1}: {exc}")
 
-        if trades:
-            storage.add_trades_bulk(trades)
-        st.success(f"{len(trades)}건 반영 완료 → {biz}")
+        saved_n, db_dup, file_dup = save_trades_with_dedupe(
+            storage,
+            trades,
+            market=MARKET_OVERSEAS,
+            force_duplicates=force_ov_dup,
+        )
+        zero_fx_n = sum(1 for t in trades if float(getattr(t, "fx_rate", 0) or 0) <= 0)
+        msg = f"{saved_n}건 반영 완료 → {biz} / {ov_account.name}"
+        if db_dup or file_dup:
+            msg += f" (DB중복 {db_dup}건, 파일중복 {file_dup}건 제외)"
+        if zero_fx_n:
+            msg += f" (환율 0 등록 {zero_fx_n}건 · 임의 환산 없음)"
+        st.success(msg)
         if errors:
             with st.expander(f"오류/스킵 {len(errors)}건"):
                 for e in errors:
                     st.write(e)
-        for k in ("ov_broker_token", "ov_broker_notes", "ov_broker_df", "ov_broker_editor"):
+        for k in (
+            "ov_broker_token",
+            "ov_broker_notes",
+            "ov_broker_df",
+            "ov_broker_editor",
+            "ov_broker_source",
+        ):
             st.session_state.pop(k, None)
         st.rerun()
     except Exception as exc:  # noqa: BLE001
@@ -2396,6 +2741,20 @@ def page_broker(
         biz = st.selectbox("반영할 사업자", biz_names, index=default_idx)
     with c2:
         broker = st.selectbox("증권사", ["자동 감지", *list_brokers()])
+    dom_biz = next((b for b in businesses if b.name == biz), None)
+    detected_broker = st.session_state.get("broker_parse_name") or (
+        "" if broker == "자동 감지" else broker
+    )
+    dom_account = None
+    if dom_biz and dom_biz.id is not None:
+        dom_account = select_trade_account(
+            storage,
+            int(dom_biz.id),
+            market,
+            key="dom_broker_account",
+            detected_name=str(detected_broker or ""),
+        )
+    force_dom_dup = render_dedupe_controls("dom_broker")
 
     up = st.file_uploader(
         "증권사 거래내역 업로드",
@@ -2424,6 +2783,15 @@ def page_broker(
                     broker_hint=broker,
                 )
                 edited = result.dataframe.copy()
+                if "거래유형" in edited.columns:
+                    kind = edited["거래유형"].astype(str)
+                    drop_div = kind.str.contains("배당", na=False)
+                    n_div = int(drop_div.sum())
+                    if n_div:
+                        edited = edited.loc[~drop_div].reset_index(drop=True)
+                        result.notes.append(
+                            f"배당 {n_div}건은 증권사 변환기에서 제외했습니다."
+                        )
                 # 0건이거나 컬럼만 있는 경우 → 수동 입력용 빈 행 5개
                 if edited.empty or (
                     "수량" in edited.columns
@@ -2522,6 +2890,8 @@ def page_broker(
         else:
             to_save["사업자"] = to_save["사업자"].fillna(biz).replace("", biz)
 
+        if dom_account is None or dom_account.id is None:
+            raise ValueError("증권사/계좌를 선택하세요.")
         source_name = st.session_state.get("broker_parse_name", "broker")
         trades, errors = dataframe_to_trades(
             to_save,
@@ -2529,10 +2899,18 @@ def page_broker(
             default_business=biz,
             source=f"broker:{source_name}",
             market=market,
+            account_id=int(dom_account.id),
         )
-        if trades:
-            storage.add_trades_bulk(trades)
-        st.success(f"{len(trades)}건 반영 완료 ({source_name} → {biz})")
+        saved_n, db_dup, file_dup = save_trades_with_dedupe(
+            storage,
+            trades,
+            market=market,
+            force_duplicates=force_dom_dup,
+        )
+        msg = f"{saved_n}건 반영 완료 ({source_name} → {biz} / {dom_account.name})"
+        if db_dup or file_dup:
+            msg += f" (DB중복 {db_dup}건, 파일중복 {file_dup}건 제외)"
+        st.success(msg)
         if errors:
             with st.expander(f"오류/스킵 {len(errors)}건"):
                 for e in errors:
@@ -2589,6 +2967,16 @@ def page_legacy_journal(
                 break
 
     biz = st.selectbox("등록할 사업자", biz_names, index=default_idx, key="legacy_biz")
+    legacy_biz = next((b for b in businesses if b.name == biz), None)
+    legacy_account = None
+    if legacy_biz and legacy_biz.id is not None:
+        legacy_account = select_trade_account(
+            storage,
+            int(legacy_biz.id),
+            market,
+            key=f"legacy_account_{market}",
+        )
+    force_legacy_dup = render_dedupe_controls(f"legacy_{market}")
 
     if st.session_state.pop("_legacy_toast", False):
         st.toast(
@@ -2700,20 +3088,31 @@ def page_legacy_journal(
                 ]
             to_save["사업자"] = biz
 
+            if legacy_account is None or legacy_account.id is None:
+                raise ValueError("증권사/계좌를 선택하세요.")
             trades, errors = dataframe_to_trades(
                 to_save,
                 storage,
                 default_business=biz,
                 source="legacy_journal",
                 market=market,
+                account_id=int(legacy_account.id),
             )
-            if trades:
-                storage.add_trades_bulk(trades)
+            saved_n, db_dup, file_dup = save_trades_with_dedupe(
+                storage,
+                trades,
+                market=market,
+                force_duplicates=force_legacy_dup,
+            )
 
             st.session_state["_legacy_toast"] = True
             st.session_state["_legacy_toast_msg"] = (
-                f"✅ 기초 데이터 {len(trades)}건이 '{biz}'에 등록되었습니다!"
+                f"✅ 기초 데이터 {saved_n}건이 '{biz}' / '{legacy_account.name}'에 등록되었습니다!"
             )
+            if db_dup or file_dup:
+                st.session_state["_legacy_toast_msg"] += (
+                    f" (DB중복 {db_dup}건, 파일중복 {file_dup}건 제외)"
+                )
             if errors:
                 st.session_state["_legacy_toast_msg"] += f" (스킵 {len(errors)}건)"
 
@@ -2850,6 +3249,7 @@ def page_masters(
                         "거래처코드": a.code or "",
                         "거래처명": a.name,
                         "계좌번호": a.account_no or "",
+                        "거래건수": storage.count_trades_for_account(int(a.id)),
                         "비고": a.note or "",
                     }
                     for a in accounts
@@ -2872,6 +3272,7 @@ def page_masters(
                     "거래처코드",
                     "거래처명",
                     "계좌번호",
+                    "거래건수",
                     "비고",
                 ],
                 key="master_account_editor",
@@ -2887,6 +3288,10 @@ def page_masters(
             ):
                 if selected_accounts.empty:
                     st.info("삭제할 거래처를 선택해 주세요.")
+                elif "거래건수" in selected_accounts.columns and int(
+                    selected_accounts["거래건수"].fillna(0).gt(0).sum()
+                ) > 0:
+                    st.warning("거래 내역이 있는 증권사/계좌는 삭제할 수 없습니다. 먼저 거래를 옮기세요.")
                 else:
                     try:
                         ids = [int(x) for x in selected_accounts["ID"].tolist()]
@@ -2900,6 +3305,26 @@ def page_masters(
                         st.error(str(exc))
         else:
             st.info("등록된 거래처가 없습니다.")
+
+        unassigned = next(
+            (a for a in accounts if a.name == UNASSIGNED_ACCOUNT_NAME and a.id),
+            None,
+        )
+        targets = [
+            a for a in accounts if a.id and a.name != UNASSIGNED_ACCOUNT_NAME
+        ]
+        if unassigned and targets:
+            st.markdown("##### 미지정 거래 증권사 이전")
+            dest_name = st.selectbox(
+                "이전할 증권사",
+                [a.name for a in targets],
+                key=f"reassign_dest_{market}",
+            )
+            if st.button("미지정 거래를 선택한 증권사로 옮기기", key=f"reassign_{market}"):
+                dest = next(a for a in targets if a.name == dest_name)
+                n = storage.reassign_account_trades(int(unassigned.id), int(dest.id))
+                st.toast(f"{n}건을 '{dest.name}'으로 옮겼습니다.")
+                st.rerun()
 
         st.divider()
         st.markdown("##### 신규 거래처 추가")
@@ -3220,6 +3645,54 @@ def page_settings(
             )
 
 
+@st.dialog("🗑️ 이자·배당 내역 전체 삭제")
+def confirm_clear_income_records_dialog(
+    storage: Storage,
+    business_id: int,
+    business_name: str,
+) -> None:
+    """현재 선택 사업자의 이자·배당 내역 전체 삭제 확인."""
+    db = get_storage()
+    records = db.list_income_records(business_id=int(business_id))
+    st.warning(
+        f"**[{business_name}]** 사업자에 등록된 이자·배당 내역 "
+        f"**{len(records):,}건**을 모두 삭제합니다.\n\n"
+        "등록된 모든 거래 내역을 삭제하시겠습니까? 되돌릴 수 없습니다."
+    )
+    confirm = st.checkbox(
+        "위 안내를 확인했으며 전체 삭제를 진행합니다.",
+        key=f"confirm_clear_income_{business_id}",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("취소", use_container_width=True, key="clear_income_cancel"):
+            st.rerun()
+    with c2:
+        if st.button(
+            "🗑️ 전체 삭제 실행",
+            type="primary",
+            use_container_width=True,
+            disabled=not confirm,
+            key="clear_income_confirm",
+        ):
+            try:
+                n = db.clear_income_records_for_business(int(business_id))
+                st.session_state["_pending_toast"] = (
+                    f"[{business_name}] 이자·배당 내역 {n:,}건이 삭제되었습니다."
+                )
+                for k in (
+                    "income_preview_df",
+                    "income_preview_source",
+                    "income_records_editor",
+                    "income_preview_editor",
+                    "income_upload_token",
+                ):
+                    st.session_state.pop(k, None)
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.error(str(exc))
+
+
 def page_income(storage: Storage, business_id: int | None) -> None:
     """이자·배당소득 업로드 · 조회 · 전표 다운로드 (설정은 환경설정 메뉴)."""
     st.caption(
@@ -3240,7 +3713,9 @@ def page_income(storage: Storage, business_id: int | None) -> None:
     st.markdown("##### 원천징수영수증 업로드")
     st.caption(
         "Excel 권장 컬럼: 지급일, 지급액, 법인세, 지방소득세, 금융상품명, 증권사, 소득구분. "
-        "PDF는 자동 추정 후 표에서 수정하세요."
+        "KB증권 증권계좌 과세내역조회(원천징수영수증) 엑셀(원거래일자·과세표준)도 지원합니다. "
+        "PDF는 KB 계좌별과세내역·미래에셋 거래실적증명서(배당·예탁금이용료)를 지원합니다. "
+        "미리보기에서 수정 후 저장하세요."
     )
     uploaded = st.file_uploader(
         "PDF / Excel / CSV",
@@ -3248,16 +3723,32 @@ def page_income(storage: Storage, business_id: int | None) -> None:
         key="income_uploader",
     )
     if uploaded is not None:
-        result = parse_income_file(uploaded.getvalue(), uploaded.name)
-        for note in result.notes:
-            st.info(note)
-        if result.rows:
-            st.session_state["income_preview_df"] = rows_to_dataframe(result.rows)
-            st.session_state["income_preview_source"] = result.source
+        token = f"{uploaded.name}:{uploaded.size}"
+        if st.session_state.get("income_upload_token") != token:
+            result = parse_income_file(uploaded.getvalue(), uploaded.name)
+            for note in result.notes:
+                st.info(note)
+            if result.rows:
+                st.session_state["income_preview_df"] = rows_to_dataframe(result.rows)
+                st.session_state["income_preview_source"] = result.source
+                st.session_state["income_upload_token"] = token
+                st.session_state.pop("income_preview_editor", None)
+            else:
+                for note in result.notes:
+                    st.warning(note)
+        else:
+            # 동일 파일 유지 중 — 이전 파싱 노트만 필요 시 생략
+            pass
 
     preview = st.session_state.get("income_preview_df")
-    if preview is not None and not preview.empty:
+    if preview is not None and not getattr(preview, "empty", True):
         st.markdown("##### 파싱 미리보기 (저장 전 수정)")
+        st.caption(
+            "환율이 0인 외화배당은 **환율** 칸에 직접 입력하세요. "
+            "입력 즉시 지급액·법인세·메모가 재계산됩니다. "
+            "(지급액 = 외화지급액 × 환율, 법인세 = 외화원천세 × 환율)"
+        )
+        preview = ensure_income_preview_columns(preview)
         edited_preview = st.data_editor(
             preview,
             use_container_width=True,
@@ -3266,8 +3757,27 @@ def page_income(storage: Storage, business_id: int | None) -> None:
             key="income_preview_editor",
             column_config={
                 "지급일": st.column_config.TextColumn("지급일", help="YYYY-MM-DD"),
-                "지급액": st.column_config.NumberColumn("지급액", format="%.0f"),
-                "법인세": st.column_config.NumberColumn("법인세", format="%.0f"),
+                "종목코드": st.column_config.TextColumn("종목코드", width="small"),
+                "통화": st.column_config.TextColumn("통화", width="small"),
+                "외화지급액": st.column_config.NumberColumn(
+                    "외화지급액", format="%.2f", help="외화 기준 지급액"
+                ),
+                "외화원천세": st.column_config.NumberColumn(
+                    "외화원천세", format="%.2f", help="외화 기준 원천세"
+                ),
+                "환율": st.column_config.NumberColumn(
+                    "환율",
+                    format="%.2f",
+                    min_value=0.0,
+                    step=0.1,
+                    help="미기재(0)인 경우 직접 입력 → 원화 자동 환산",
+                ),
+                "지급액": st.column_config.NumberColumn(
+                    "지급액(원)", format="%.0f", help="외화×환율 자동계산"
+                ),
+                "법인세": st.column_config.NumberColumn(
+                    "법인세(원)", format="%.0f", help="외화원천세×환율 자동계산"
+                ),
                 "지방소득세": st.column_config.NumberColumn(
                     "지방소득세", format="%.0f"
                 ),
@@ -3275,7 +3785,37 @@ def page_income(storage: Storage, business_id: int | None) -> None:
                     "소득구분", options=["이자", "배당"]
                 ),
             },
+            disabled=["종목코드", "통화"],
         )
+        # 환율 변경 → 지급액·법인세·메모 즉시 재계산
+        recalced = apply_income_fx_rates(edited_preview)
+        fx_changed = False
+        try:
+            prev_fx = pd.to_numeric(preview["환율"], errors="coerce").fillna(0.0).reset_index(drop=True)
+            new_fx = pd.to_numeric(recalced["환율"], errors="coerce").fillna(0.0).reset_index(drop=True)
+            prev_pay = pd.to_numeric(preview["지급액"], errors="coerce").fillna(0.0).reset_index(drop=True)
+            new_pay = pd.to_numeric(recalced["지급액"], errors="coerce").fillna(0.0).reset_index(drop=True)
+            prev_tax = pd.to_numeric(preview["법인세"], errors="coerce").fillna(0.0).reset_index(drop=True)
+            new_tax = pd.to_numeric(recalced["법인세"], errors="coerce").fillna(0.0).reset_index(drop=True)
+            has_fx_rows = bool(
+                (pd.to_numeric(recalced["외화지급액"], errors="coerce").fillna(0) > 0).any()
+            )
+            if has_fx_rows and len(prev_fx) == len(new_fx):
+                if (
+                    not prev_fx.equals(new_fx)
+                    or not prev_pay.equals(new_pay)
+                    or not prev_tax.equals(new_tax)
+                ):
+                    fx_changed = True
+        except Exception:  # noqa: BLE001
+            fx_changed = False
+
+        st.session_state["income_preview_df"] = recalced
+        if fx_changed:
+            st.session_state.pop("income_preview_editor", None)
+            st.rerun()
+
+        edited_preview = recalced
         c_save, c_clear = st.columns(2)
         if c_save.button(
             "💾 미리보기 내역 DB 저장",
@@ -3285,10 +3825,17 @@ def page_income(storage: Storage, business_id: int | None) -> None:
         ):
             try:
                 src = st.session_state.get("income_preview_source", "excel")
+                to_save = apply_income_fx_rates(edited_preview)
                 n = 0
-                for _, row in edited_preview.iterrows():
+                skipped_fx = 0
+                for _, row in to_save.iterrows():
                     pay = str(row.get("지급일") or "").strip()[:10]
                     gross = float(row.get("지급액") or 0)
+                    amt_fx = float(row.get("외화지급액") or 0)
+                    fx = float(row.get("환율") or 0)
+                    if amt_fx > 0 and fx <= 0:
+                        skipped_fx += 1
+                        continue
                     if not pay or gross <= 0:
                         continue
                     itype = (
@@ -3310,7 +3857,11 @@ def page_income(storage: Storage, business_id: int | None) -> None:
                     )
                     n += 1
                 st.session_state.pop("income_preview_df", None)
+                st.session_state.pop("income_preview_editor", None)
+                st.session_state.pop("income_upload_token", None)
                 msg = f"{n}건의 이자·배당 내역을 저장했습니다."
+                if skipped_fx:
+                    msg += f" (환율 미입력 외화 {skipped_fx}건 제외)"
                 st.session_state["_pending_toast"] = msg
                 st.toast(msg)
                 st.rerun()
@@ -3318,11 +3869,27 @@ def page_income(storage: Storage, business_id: int | None) -> None:
                 st.error(str(exc))
         if c_clear.button("미리보기 지우기", use_container_width=True):
             st.session_state.pop("income_preview_df", None)
+            st.session_state.pop("income_preview_editor", None)
+            st.session_state.pop("income_upload_token", None)
             st.rerun()
 
     st.divider()
-    st.markdown("##### 등록된 내역")
+    head_l, head_r = st.columns([3, 1])
+    with head_l:
+        st.markdown("##### 등록된 내역")
     records = storage.list_income_records(business_id=business_id)
+    with head_r:
+        if st.button(
+            "🗑️ 전체 삭제",
+            use_container_width=True,
+            type="secondary",
+            disabled=not records,
+            key="income_clear_all",
+            help="현재 사업자의 이자·배당 내역을 모두 삭제합니다",
+        ):
+            confirm_clear_income_records_dialog(
+                storage, int(business_id), company_name or str(business_id)
+            )
     if records:
         rec_df = pd.DataFrame(
             [
@@ -3541,7 +4108,7 @@ def main() -> None:
     st.sidebar.divider()
     menu = sidebar_tree_menu()
     st.sidebar.divider()
-    st.sidebar.caption(f"DB: {storage.db_path}")
+    st.sidebar.caption("DB: Supabase · 배포: Streamlit Cloud")
 
     # F5 복원용 URL 동기화 (사업자·메뉴·시장)
     sync_url_params()

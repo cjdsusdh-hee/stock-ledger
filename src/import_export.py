@@ -7,7 +7,7 @@ from typing import Any
 
 import pandas as pd
 
-from .models import Trade, normalize_side, now_str
+from .models import Trade, coerce_fx_rate, normalize_currency, normalize_side, now_str
 from .storage import Storage
 
 # 표준 매매일지 컬럼 (한글 헤더)
@@ -37,6 +37,11 @@ COLUMN_ALIASES = {
     "제세금": ["제세금", "세금", "거래세", "제세", "tax"],
     "정산금액": ["정산금액", "결제금액", "거래금액", "금액", "settlement", "amount"],
     "메모": ["메모", "비고", "적요", "memo", "note"],
+    "환율": ["환율", "적용환율", "적용 환율", "fx_rate", "exchange_rate"],
+    "통화": ["통화", "통화코드", "currency", "ccy"],
+    "외화단가": ["외화단가", "외화가격", "price_fx"],
+    "외화수수료": ["외화수수료", "fee_fx"],
+    "외화제세금": ["외화제세금", "tax_fx"],
 }
 
 
@@ -103,6 +108,8 @@ def dataframe_to_trades(
     default_business: str | None = None,
     source: str = "csv",
     market: str = "domestic",
+    account_id: int | None = None,
+    default_account_name: str | None = None,
 ) -> tuple[list[Trade], list[str]]:
     """표준/유사 컬럼 DataFrame을 Trade 리스트로 변환하고 종목/사업자를 자동 생성."""
     from .models import normalize_market
@@ -162,8 +169,58 @@ def dataframe_to_trades(
                 settlement = _to_float(row.get("정산금액"))
             memo = str(row.get("메모", "") or "").strip()
 
+            # 환율: 비어 있으면 추정하지 않고 0 등록
+            fx_raw = row.get("환율") if "환율" in work.columns else None
+            if fx_raw is None and "적용환율" in work.columns:
+                fx_raw = row.get("적용환율")
+            fx_rate = coerce_fx_rate(fx_raw)
+            price_fx = (
+                _to_float(row.get("외화단가", 0))
+                if "외화단가" in work.columns
+                else 0.0
+            )
+            fee_fx = (
+                _to_float(row.get("외화수수료", 0))
+                if "외화수수료" in work.columns
+                else 0.0
+            )
+            tax_fx = (
+                _to_float(row.get("외화제세금", 0))
+                if "외화제세금" in work.columns
+                else 0.0
+            )
+            currency = "KRW"
+            if "통화" in work.columns:
+                currency = normalize_currency(str(row.get("통화") or "KRW"))
+            elif "통화코드" in work.columns:
+                currency = normalize_currency(str(row.get("통화코드") or "KRW"))
+
             if qty <= 0:
                 raise ValueError("수량은 0보다 커야 합니다.")
+
+            resolved_account_id = account_id
+            account_name = ""
+            account_code = ""
+            broker_col = ""
+            if "증권사" in work.columns:
+                broker_col = str(row.get("증권사") or "").strip()
+            if resolved_account_id is None:
+                acc_name = broker_col or (default_account_name or "").strip()
+                if not acc_name:
+                    raise ValueError("증권사/계좌를 선택하세요.")
+                account = storage.get_or_create_account(
+                    int(business.id),  # type: ignore[arg-type]
+                    acc_name,
+                    market=mkt,
+                )
+                resolved_account_id = int(account.id) if account.id is not None else None
+                account_name = account.name
+                account_code = account.code
+            else:
+                account = storage.get_account(int(resolved_account_id))
+                if account:
+                    account_name = account.name
+                    account_code = account.code
 
             trades.append(
                 Trade(
@@ -183,6 +240,14 @@ def dataframe_to_trades(
                     business_name=business.name,
                     stock_code=stock.code,
                     stock_name=stock.name,
+                    currency=currency,
+                    fx_rate=fx_rate,
+                    price_fx=price_fx,
+                    fee_fx=fee_fx,
+                    tax_fx=tax_fx,
+                    account_id=resolved_account_id,
+                    account_name=account_name,
+                    account_code=account_code,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - row-level collect
@@ -198,7 +263,11 @@ def import_standard_file(
     *,
     default_business: str | None = None,
     market: str = "domestic",
+    account_id: int | None = None,
+    skip_duplicates: bool = True,
 ) -> tuple[int, list[str]]:
+    from .dedupe import classify_trades
+
     df = read_tabular(file_bytes, filename)
     trades, errors = dataframe_to_trades(
         df,
@@ -206,7 +275,19 @@ def import_standard_file(
         default_business=default_business,
         source="csv",
         market=market,
+        account_id=account_id,
     )
+    if skip_duplicates and trades:
+        existing = storage.list_trades(
+            business_id=trades[0].business_id,
+            market=market,
+            account_id=account_id,
+        )
+        classified = classify_trades(trades, existing)
+        skipped = classified.db_dup_count + classified.file_dup_count
+        trades = classified.fresh
+        if skipped:
+            errors.append(f"중복 {skipped}건은 제외했습니다.")
     if trades:
         storage.add_trades_bulk(trades)
     return len(trades), errors
@@ -242,6 +323,7 @@ def trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
                     if t.side == "BUY"
                     else qty * price - t.fee
                 ),
+                "증권사": getattr(t, "account_name", "") or "",
                 "메모": t.memo,
                 "출처": t.source,
                 "ID": t.id,
@@ -253,6 +335,7 @@ def trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
         "사업자",
         "종목코드",
         "종목명",
+        "증권사",
         "거래유형",
         "수량",
         "거래금액(원가)",
@@ -282,6 +365,7 @@ def positions_to_dataframe(positions) -> pd.DataFrame:
         rows.append(
             {
                 "사업자": p.business_name,
+                "증권사": getattr(p, "account_name", "") or "",
                 "종목코드": p.stock_code,
                 "종목명": p.stock_name,
                 "잔여수량": p.quantity,
@@ -300,10 +384,19 @@ def sell_results_to_dataframe(sell_results) -> pd.DataFrame:
             {
                 "거래일자": s.trade_date,
                 "사업자": s.business_name,
+                "증권사": getattr(s, "account_name", "") or "",
                 "종목코드": s.stock_code,
                 "종목명": s.stock_name,
                 "매도수량": s.quantity,
                 "매도단가": s.price,
+                "매도금액": round(float(s.quantity or 0) * float(s.price or 0), 2),
+                "FIFO원가": round(
+                    sum(
+                        float(m.matched_qty or 0) * float(m.buy_price or 0)
+                        for m in (s.matches or [])
+                    ),
+                    2,
+                ),
                 "수수료": s.fee,
                 "실현손익": round(s.realized_pnl, 2),
                 "부족수량": s.shortfall_qty,

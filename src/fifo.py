@@ -7,6 +7,12 @@ from copy import deepcopy
 
 from .models import Lot, MatchDetail, Position, SellResult, Trade
 
+FifoKey = tuple[int, int, int]
+
+
+def _account_id(trade: Trade) -> int:
+    return int(getattr(trade, "account_id", 0) or 0)
+
 
 class FifoEngine:
     """거래 리스트를 시간순으로 재생하여 FIFO 잔고/실현손익을 계산."""
@@ -15,23 +21,24 @@ class FifoEngine:
         self.trades = sorted(trades, key=lambda t: (t.trade_date, t.id or 0))
 
     def run(self) -> tuple[list[Position], list[SellResult], list[str]]:
-        lots: dict[tuple[int, int], list[Lot]] = defaultdict(list)
+        lots: dict[FifoKey, list[Lot]] = defaultdict(list)
         sell_results: list[SellResult] = []
-        realized_by_key: dict[tuple[int, int], float] = defaultdict(float)
+        realized_by_key: dict[FifoKey, float] = defaultdict(float)
         warnings: list[str] = []
 
-        meta: dict[tuple[int, int], dict[str, str]] = {}
+        meta: dict[FifoKey, dict[str, str | int | None]] = {}
 
         for trade in self.trades:
-            key = (trade.business_id, trade.stock_id)
+            key: FifoKey = (trade.business_id, _account_id(trade), trade.stock_id)
             meta[key] = {
                 "business_name": trade.business_name,
                 "stock_code": trade.stock_code,
                 "stock_name": trade.stock_name,
+                "account_id": getattr(trade, "account_id", None),
+                "account_name": getattr(trade, "account_name", "") or "",
             }
 
             if trade.side == "DIVIDEND":
-                # 외화배당은 FIFO 수량에 영향 없음
                 continue
 
             if trade.side == "BUY":
@@ -48,11 +55,12 @@ class FifoEngine:
                         stock_code=trade.stock_code,
                         stock_name=trade.stock_name,
                         business_name=trade.business_name,
+                        account_id=getattr(trade, "account_id", None),
+                        account_name=getattr(trade, "account_name", "") or "",
                     )
                 )
                 continue
 
-            # SELL
             remaining_to_sell = trade.quantity
             matches: list[MatchDetail] = []
             realized = 0.0
@@ -91,8 +99,10 @@ class FifoEngine:
 
             shortfall = remaining_to_sell if remaining_to_sell > 1e-12 else 0.0
             if shortfall > 0:
+                acc = getattr(trade, "account_name", "") or ""
+                prefix = f"{acc}/" if acc else ""
                 warnings.append(
-                    f"[{trade.trade_date}] {trade.business_name}/{trade.stock_name}"
+                    f"[{trade.trade_date}] {trade.business_name}/{prefix}{trade.stock_name}"
                     f" 매도수량 부족 (부족 {shortfall:.4f}주)"
                 )
 
@@ -112,30 +122,42 @@ class FifoEngine:
                     stock_code=trade.stock_code,
                     stock_name=trade.stock_name,
                     business_name=trade.business_name,
+                    account_id=getattr(trade, "account_id", None),
+                    account_name=getattr(trade, "account_name", "") or "",
                 )
             )
 
         positions: list[Position] = []
         all_keys = set(lots.keys()) | set(realized_by_key.keys()) | set(meta.keys())
-        for key in sorted(all_keys, key=lambda k: (meta.get(k, {}).get("business_name", ""), meta.get(k, {}).get("stock_name", ""))):
+
+        def _sort_key(k: FifoKey) -> tuple[str, str, str]:
+            info = meta.get(k, {})
+            return (
+                str(info.get("business_name") or ""),
+                str(info.get("account_name") or ""),
+                str(info.get("stock_name") or ""),
+            )
+
+        for key in sorted(all_keys, key=_sort_key):
             active_lots = [deepcopy(lot) for lot in lots.get(key, []) if lot.remaining_qty > 1e-12]
             qty = sum(lot.remaining_qty for lot in active_lots)
-            # 원가잔액: 잔여 로트의 매수대금 합 (수량×단가, 수수료 제외)
             total_cost = sum(lot.cost_basis for lot in active_lots)
             avg_price = (total_cost / qty) if qty > 0 else 0.0
             info = meta.get(key, {})
             positions.append(
                 Position(
                     business_id=key[0],
-                    business_name=info.get("business_name", ""),
-                    stock_id=key[1],
-                    stock_code=info.get("stock_code", ""),
-                    stock_name=info.get("stock_name", ""),
+                    business_name=str(info.get("business_name") or ""),
+                    stock_id=key[2],
+                    stock_code=str(info.get("stock_code") or ""),
+                    stock_name=str(info.get("stock_name") or ""),
                     quantity=qty,
                     avg_price=avg_price,
                     total_cost=total_cost,
                     realized_pnl=realized_by_key.get(key, 0.0),
                     lots=active_lots,
+                    account_id=info.get("account_id") if info.get("account_id") else key[1] or None,
+                    account_name=str(info.get("account_name") or ""),
                 )
             )
         return positions, sell_results, warnings
