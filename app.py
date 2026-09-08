@@ -2571,7 +2571,8 @@ def page_standard_import(
 
 def page_broker_overseas(storage: Storage) -> None:
     """해외주식 증권사 변환기: 미래에셋 PDF · KB증권 엑셀 → 검수 후 일괄 등록."""
-    from src.brokers.kb_overseas import is_kb_overseas_excel, parse_kb_overseas_excel
+    from src.brokers.generic_overseas import parse_generic_overseas_excel
+    from src.brokers.kb_overseas import parse_kb_overseas_excel
     from src.brokers.mirae_overseas import (
         apply_overseas_preview_fx,
         ensure_overseas_preview_columns,
@@ -2581,10 +2582,9 @@ def page_broker_overseas(storage: Storage) -> None:
 
     st.subheader("해외주식 증권사 변환기")
     st.caption(
-        "읽을 수 있는 파일은 **미래에셋 해외주식 거래내역서 PDF**, "
-        "**KB증권 증권계좌거래내역 엑셀**뿐입니다. "
-        "아래 증권사/계좌는 저장할 곳입니다. 메리츠 등 다른 증권사 원본은 "
-        "**표준 엑셀** 또는 **직접 입력**을 쓰세요."
+        "미래에셋 해외주식 거래내역서 PDF, KB 증권계좌거래내역 엑셀, "
+        "메리츠 등 **컬럼형 해외주식 거래내역 엑셀**을 읽습니다. "
+        "아래 증권사/계좌는 저장할 곳입니다."
     )
 
     businesses = storage.list_businesses()
@@ -2611,6 +2611,8 @@ def page_broker_overseas(storage: Storage) -> None:
             detected = "KB증권"
         elif "mirae" in src.lower() or "미래" in src:
             detected = "미래에셋증권"
+        elif "meritz" in src.lower() or "메리츠" in src:
+            detected = "메리츠증권"
         ov_account = select_trade_account(
             storage,
             int(ov_biz.id),
@@ -2623,7 +2625,7 @@ def page_broker_overseas(storage: Storage) -> None:
         "해외주식 거래내역 (PDF / Excel)",
         type=["pdf", "xlsx", "xls"],
         key="ov_broker_up",
-        help="미래에셋 거래내역서 PDF 또는 KB증권 증권계좌거래내역 엑셀",
+        help="미래에셋 PDF, KB·메리츠 등 해외주식 거래내역 엑셀",
         on_change=persist_uploaded_file,
         args=("ov_broker_up", "_ov_broker_file"),
     )
@@ -2640,14 +2642,13 @@ def page_broker_overseas(storage: Storage) -> None:
                         result = parse_mirae_overseas_pdf(up_bytes, up_name)
                     else:
                         result = parse_kb_overseas_excel(up_bytes, up_name)
+                        if not (result.get("rows") or []):
+                            result = parse_generic_overseas_excel(up_bytes, up_name)
                     if not (result.get("rows") or []):
                         notes = [n for n in (result.get("notes") or []) if n]
-                        notes.extend(
-                            [
-                                f"이 파일({up_name})에서 해외주식 거래를 찾지 못했습니다.",
-                                "지원: 미래에셋 해외주식 거래내역서 PDF, KB증권 증권계좌거래내역 엑셀.",
-                                "메리츠 등 다른 증권사 원본은 표준 엑셀 또는 직접 입력을 사용하세요.",
-                            ]
+                        notes.append(
+                            f"이 파일({up_name})에서 해외주식 거래를 찾지 못했습니다. "
+                            "거래일자·매매구분·수량·단가 컬럼이 있는 엑셀인지 확인하세요."
                         )
                         result["rows"] = []
                         result["notes"] = list(dict.fromkeys(notes))
@@ -2676,7 +2677,7 @@ def page_broker_overseas(storage: Storage) -> None:
             if not notes:
                 st.error(
                     "파일을 받았지만 거래를 추출하지 못했습니다. "
-                    "미래에셋 해외주식 PDF 또는 KB 증권계좌거래내역 엑셀인지 확인하세요."
+                    "거래일자·매매구분·수량·단가가 있는 엑셀인지 확인하세요."
                 )
         else:
             st.info("PDF 또는 엑셀을 업로드하면 파싱 미리보기가 표시됩니다.")
