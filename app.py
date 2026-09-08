@@ -360,6 +360,36 @@ def show_uploaded_file(name: str | None, size: int = 0) -> None:
     st.success(f"파일 선택됨: **{name}** ({int(size):,}바이트)")
 
 
+INGEST_DONE_KEY = "_ingest_done"
+
+
+def dismiss_ingest_done() -> None:
+    st.session_state.pop(INGEST_DONE_KEY, None)
+
+
+def queue_ingest_done(message: str, *, errors: list | None = None) -> None:
+    """엑셀 등록이 끝난 뒤 rerun에서 완료 창을 띄운다."""
+    st.session_state[INGEST_DONE_KEY] = {
+        "message": message,
+        "errors": [str(e) for e in (errors or [])],
+    }
+
+
+@st.dialog("작업 완료", on_dismiss=dismiss_ingest_done)
+def show_ingest_done_dialog() -> None:
+    payload = st.session_state.get(INGEST_DONE_KEY) or {}
+    message = str(payload.get("message") or "등록이 완료되었습니다.")
+    st.success(message)
+    errors = payload.get("errors") or []
+    if errors:
+        with st.expander(f"오류/스킵 {len(errors)}건"):
+            for err in errors:
+                st.write(err)
+    if st.button("확인", type="primary", use_container_width=True, key="ingest_done_ok"):
+        dismiss_ingest_done()
+        st.rerun()
+
+
 def render_dedupe_controls(prefix: str) -> bool:
     """중복 제외가 기본. True면 중복도 강제 등록."""
     st.caption("같은 증권사·일자·종목·수량·단가·수수료는 중복으로 봅니다.")
@@ -518,7 +548,13 @@ def _blank_opening_df(market: str, n: int = 8) -> pd.DataFrame:
 def trade_table_column_config() -> dict:
     """거래 내역 테이블 숫자 컬럼 천단위 쉼표 포맷."""
     return {
-        "수량": st.column_config.NumberColumn("수량", format="%,d"),
+        "거래일자": st.column_config.TextColumn("거래일자"),
+        "수량": st.column_config.NumberColumn("수량", format="%g"),
+        "외화단가": st.column_config.NumberColumn("외화단가", format="%.4f"),
+        "거래/정산금액": st.column_config.NumberColumn("거래/정산금액", format="%.4f"),
+        "외화수수료": st.column_config.NumberColumn("외화수수료", format="%.4f"),
+        "외화제세금": st.column_config.NumberColumn("외화제세금", format="%.4f"),
+        "환율": st.column_config.NumberColumn("환율", format="%.2f"),
         "거래금액(원가)": st.column_config.NumberColumn(
             "거래금액(원가)", format="%,d 원", help="수량 × 단가"
         ),
@@ -551,7 +587,20 @@ def _filter_stock_trades(
             pd.to_numeric(detail["수량"], errors="coerce").fillna(0)
             * pd.to_numeric(detail["단가"], errors="coerce").fillna(0)
         )
-    for col in ("수량", "거래금액(원가)", "단가", "수수료", "제세금", "정산금액", "ID"):
+    for col in (
+        "수량",
+        "외화단가",
+        "거래/정산금액",
+        "외화수수료",
+        "외화제세금",
+        "환율",
+        "거래금액(원가)",
+        "단가",
+        "수수료",
+        "제세금",
+        "정산금액",
+        "ID",
+    ):
         if col in detail.columns:
             detail[col] = pd.to_numeric(detail[col], errors="coerce")
 
@@ -616,9 +665,17 @@ def _sort_trades_chronologically(df: pd.DataFrame) -> pd.DataFrame:
 
 DETAIL_TRADE_COLUMNS = [
     "거래일자",
+    "증권사",
+    "종목코드",
     "종목명",
     "거래유형",
     "수량",
+    "외화단가",
+    "거래/정산금액",
+    "외화수수료",
+    "외화제세금",
+    "환율",
+    "통화",
     "거래금액(원가)",
     "단가",
     "수수료",
@@ -682,7 +739,7 @@ def show_stock_detail_modal(
     work["거래일자"] = [
         _normalize_trade_date(v) for v in work["거래일자"]
     ]
-    work["ID"] = pd.to_numeric(work["ID"], errors="coerce").astype("Int64")
+    work["ID"] = pd.to_numeric(work["ID"], errors="coerce")
     original_dates = {
         int(tid): _normalize_trade_date(dt)
         for tid, dt in zip(work["ID"], work["거래일자"])
@@ -691,17 +748,6 @@ def show_stock_detail_modal(
 
     # 조회용 표: 매수(빨강) / 매도(파랑) / 배당(초록)
     view = work.loc[:, [c for c in display_cols if c in work.columns]].copy()
-    detail_col_config = {
-        "거래일자": st.column_config.DateColumn("거래일자", format="YYYY-MM-DD"),
-        "수량": st.column_config.NumberColumn("수량", format="%,d"),
-        "거래금액(원가)": st.column_config.NumberColumn(
-            "거래금액(원가)", format="%,d 원", help="수량 × 단가"
-        ),
-        "단가": st.column_config.NumberColumn("단가", format="%,d 원"),
-        "수수료": st.column_config.NumberColumn("수수료", format="%,d 원"),
-        "제세금": st.column_config.NumberColumn("제세금", format="%,d 원"),
-        "정산금액": st.column_config.NumberColumn("정산금액", format="%,d 원"),
-    }
     if "거래유형" in view.columns:
         styled_df = view.style.map(_highlight_trade_type, subset=["거래유형"])
     else:
@@ -710,14 +756,26 @@ def show_stock_detail_modal(
         styled_df,
         use_container_width=True,
         hide_index=True,
-        column_config=detail_col_config,
+        column_config=trade_table_column_config(),
     )
 
     # data_editor는 Styler 색상을 지원하지 않아, 일자 수정만 별도 편집기로 유지
     with st.expander("✏️ 거래일자 수정", expanded=False):
         edit_cols = [c for c in ("거래일자", "거래유형", "ID") if c in work.columns]
+        edit_df = work.loc[:, edit_cols].copy()
+        if "거래일자" in edit_df.columns:
+            # DateColumn은 datetime64만 허용. YYYY-MM-DD 문자열이면 Cloud에서 예외가 난다.
+            edit_df["거래일자"] = pd.to_datetime(
+                edit_df["거래일자"].map(_normalize_trade_date),
+                format="%Y-%m-%d",
+                errors="coerce",
+            )
+        if "ID" in edit_df.columns:
+            edit_df["ID"] = (
+                pd.to_numeric(edit_df["ID"], errors="coerce").fillna(0).astype("int64")
+            )
         edited = st.data_editor(
-            work.loc[:, edit_cols],
+            edit_df,
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
@@ -964,13 +1022,12 @@ WORK_MENU_ITEMS = [
     ("ingest", "2. 거래 넣기"),
     ("ledger", "3. 잔고·손익"),
     ("voucher", "4. 회계전표"),
-    ("codes", "5. 계정코드"),
 ]
 EXTRA_MENU_ITEMS = [
     ("income", "이자·배당"),
 ]
 WORK_MENU_KEYS = {k for k, _ in WORK_MENU_ITEMS}
-MARKET_MENU_KEYS = WORK_MENU_KEYS | {"codes"}
+MARKET_MENU_KEYS = set(WORK_MENU_KEYS)
 INCOME_MENU_KEYS = {"income"}
 ALL_MENU_KEYS = MARKET_MENU_KEYS | INCOME_MENU_KEYS
 DEFAULT_MENU = "ledger"
@@ -987,9 +1044,8 @@ MENU_PAGE_META: dict[str, tuple[str, str]] = {
     "setup": ("준비", "증권사·종목 마스터"),
     "ingest": ("거래 넣기", "기초잔고 · 파일 업로드 · 직접 입력"),
     "ledger": ("잔고·손익", "보유 잔고 · FIFO · 처분손익"),
-    "voucher": ("회계전표", "기간별 전표 다운로드"),
-    "income": ("이자·배당소득", "원천징수 업로드 · 전표"),
-    "codes": ("계정코드", "전표에 넣을 계정과목·거래처코드"),
+    "voucher": ("회계전표", "계정코드 · 기간별 전표 다운로드"),
+    "income": ("이자·배당소득", "계정코드 · 원천징수 업로드 · 전표"),
 }
 
 STEP_GUIDES: dict[str, tuple[str, str, str, str]] = {
@@ -1013,21 +1069,15 @@ STEP_GUIDES: dict[str, tuple[str, str, str, str]] = {
     ),
     "voucher": (
         "4/4 회계전표",
-        "적요 형식과 기간을 골라 회계 전표를 받습니다. 계정코드가 비었으면 먼저 계정코드를 저장하세요.",
-        "codes",
-        "계정코드 확인",
+        "위에서 계정코드를 확인·저장한 뒤, 기간을 골라 회계 전표를 받습니다. 국내/해외는 사이드바에서 시장을 바꾼 뒤 각각 저장하세요.",
+        "",
+        "",
     ),
     "income": (
         "이자·배당",
-        "원천징수 파일을 올리고 전표를 받습니다. 계정코드는 아래 메뉴에서 관리합니다.",
-        "codes",
-        "계정코드",
-    ),
-    "codes": (
-        "5/5 계정코드",
-        "회계전표에 들어갈 투자유가증권·수수료·예금·처분손익 계정코드와 거래처코드를 저장합니다. 국내/해외를 위에서 바꾼 뒤 각각 저장하세요.",
-        "voucher",
-        "회계전표로",
+        "위에서 계정코드를 확인·저장한 뒤, 원천징수 파일을 올리고 전표를 받습니다.",
+        "",
+        "",
     ),
 }
 
@@ -1038,14 +1088,14 @@ _LEGACY_TO_MENU: dict[str, str] = {
     "ledger": "ledger",
     "voucher": "voucher",
     "income": "income",
-    "codes": "codes",
+    "codes": "voucher",
     "dashboard": "ledger",
     "trade_input": "ingest",
     "import_export": "voucher",
     "converter": "ingest",
     "base_data": "ingest",
     "stock_masters": "setup",
-    "stock_settings": "codes",
+    "stock_settings": "voucher",
     "domestic_dashboard": "ledger",
     "overseas_dashboard": "ledger",
     "domestic_trade_input": "ingest",
@@ -1058,10 +1108,10 @@ _LEGACY_TO_MENU: dict[str, str] = {
     "overseas_base_data": "ingest",
     "domestic_stock_masters": "setup",
     "overseas_stock_masters": "setup",
-    "domestic_stock_settings": "codes",
-    "overseas_stock_settings": "codes",
+    "domestic_stock_settings": "voucher",
+    "overseas_stock_settings": "voucher",
     "interest_list": "income",
-    "interest_settings": "codes",
+    "interest_settings": "income",
     "대시보드": "ledger",
     "📊 대시보드": "ledger",
     "매매 입력": "ingest",
@@ -1074,17 +1124,17 @@ _LEGACY_TO_MENU: dict[str, str] = {
     "📋 기초 데이터 등록": "ingest",
     "거래처 및 종목 관리": "setup",
     "🏢 거래처 및 종목 관리": "setup",
-    "환경설정 (주식)": "codes",
-    "⚙️ 환경설정 (주식)": "codes",
-    "⚙️ 환경설정 (주식 계정코드)": "codes",
-    "⚙️ 환경설정 (국내주식 계정코드)": "codes",
-    "⚙️ 환경설정 (해외주식 계정코드)": "codes",
-    "환경설정 / 계정과목 관리": "codes",
-    "⚙️ 환경설정 (계정과목 코드)": "codes",
+    "환경설정 (주식)": "voucher",
+    "⚙️ 환경설정 (주식)": "voucher",
+    "⚙️ 환경설정 (주식 계정코드)": "voucher",
+    "⚙️ 환경설정 (국내주식 계정코드)": "voucher",
+    "⚙️ 환경설정 (해외주식 계정코드)": "voucher",
+    "환경설정 / 계정과목 관리": "voucher",
+    "⚙️ 환경설정 (계정과목 코드)": "voucher",
     "내역 업로드·전표": "income",
     "📄 이자·배당 내역 및 전표": "income",
-    "환경설정 (이자·배당)": "codes",
-    "⚙️ 거래처 및 계정과목 설정": "codes",
+    "환경설정 (이자·배당)": "income",
+    "⚙️ 거래처 및 계정과목 설정": "income",
 }
 
 NEW_STOCK_OPTION = "➕ 신규 종목 직접 입력"
@@ -1720,8 +1770,6 @@ def route_active_menu(
         page_voucher(storage, market=market)
     elif menu == "income":
         page_income(storage, business_id)
-    elif menu == "codes":
-        page_codes(storage, business_id)
     else:
         page_dashboard(storage, business_id, market=market)
 
@@ -1763,24 +1811,6 @@ def page_ingest(
     else:
         st.caption("한 건씩 매수·매도를 직접 넣습니다.")
         page_trades(storage, business_id, market=market)
-
-
-def page_codes(storage: Storage, business_id: int | None) -> None:
-    render_step_guide("codes")
-    st.caption(
-        f"지금 시장: **{market_label(current_market())}**. "
-        "국내/해외 계정코드는 사이드바에서 시장을 바꾼 뒤 따로 저장합니다."
-    )
-    kind = st.radio(
-        "대상",
-        ["주식 매매", "이자·배당"],
-        horizontal=True,
-        key="codes_kind",
-    )
-    if kind == "이자·배당":
-        page_settings(storage, business_id, mode="income")
-    else:
-        page_settings(storage, business_id, mode="stock", market=current_market())
 
 
 def page_dashboard(
@@ -2431,11 +2461,24 @@ def _render_trade_list(
         return
 
     view = df.drop(columns=["출처"], errors="ignore").copy()
-    for col in ("수량", "거래금액(원가)", "단가", "수수료", "제세금", "정산금액", "ID"):
+    for col in (
+        "수량",
+        "외화단가",
+        "거래/정산금액",
+        "외화수수료",
+        "외화제세금",
+        "환율",
+        "거래금액(원가)",
+        "단가",
+        "수수료",
+        "제세금",
+        "정산금액",
+        "ID",
+    ):
         if col in view.columns:
             view[col] = pd.to_numeric(view[col], errors="coerce")
 
-    # 표시 순서: 수량 → 거래금액(원가) → 단가 …
+    # 표시 순서: 원본 엑셀과 같이 수량 뒤에 외화 칸
     preferred = [
         "거래일자",
         "사업자",
@@ -2444,6 +2487,12 @@ def _render_trade_list(
         "종목명",
         "거래유형",
         "수량",
+        "외화단가",
+        "거래/정산금액",
+        "외화수수료",
+        "외화제세금",
+        "환율",
+        "통화",
         "거래금액(원가)",
         "단가",
         "수수료",
@@ -2504,27 +2553,16 @@ def page_voucher(
 ) -> None:
     market = normalize_market(market)
     render_step_guide("voucher")
-    st.caption(f"시장: **{market_label(market)}**")
-    st.subheader("회계 전표")
+    st.caption(
+        f"시장: **{market_label(market)}**. "
+        "계정코드는 이 화면 위에서 저장하고, 아래 전표에 바로 반영됩니다."
+    )
     business_id = st.session_state.get("active_business_id")
-    if business_id is not None:
-        cfg = storage.get_account_config(business_id, market=market)
-        code_cols = st.columns([4, 1])
-        with code_cols[0]:
-            st.caption(
-                f"이 전표에 쓰는 계정코드 · {market_label(market)} — "
-                f"투자유가증권 `{cfg.security_code}` · 수수료 `{cfg.fee_code}` · "
-                f"기타제예금 `{cfg.deposit_code}` · 처분이익 `{cfg.gain_code}` · "
-                f"처분손실 `{cfg.loss_code}`"
-            )
-        with code_cols[1]:
-            st.button(
-                "계정코드 수정",
-                use_container_width=True,
-                key="voucher_goto_codes",
-                on_click=_activate_menu,
-                args=("codes",),
-            )
+    st.subheader("계정코드")
+    page_settings(storage, business_id, mode="stock", market=market)
+
+    st.divider()
+    st.subheader("회계 전표")
     trades = storage.list_trades(business_id=business_id, market=market)
     positions, sells, _ = compute_positions(trades)
     trades_df = trades_to_dataframe(trades)
@@ -2782,11 +2820,7 @@ def page_standard_import(
                     account_id=int(import_account.id),
                     skip_duplicates=not force_dup,
                 )
-                st.success(f"{count}건 등록 완료")
-                if errors:
-                    with st.expander(f"오류/스킵 {len(errors)}건"):
-                        for e in errors:
-                            st.write(e)
+                queue_ingest_done(f"{count}건 등록이 완료되었습니다.", errors=errors)
                 st.rerun()
             except Exception as exc:  # noqa: BLE001
                 st.error(str(exc))
@@ -3119,11 +3153,7 @@ def page_broker_overseas(storage: Storage) -> None:
             msg += f" (DB중복 {db_dup}건, 파일중복 {file_dup}건 제외)"
         if zero_fx_n:
             msg += f" (환율 0 등록 {zero_fx_n}건 · 임의 환산 없음)"
-        st.success(msg)
-        if errors:
-            with st.expander(f"오류/스킵 {len(errors)}건"):
-                for e in errors:
-                    st.write(e)
+        queue_ingest_done(msg, errors=errors)
         for k in (
             "ov_broker_token",
             "ov_broker_notes",
@@ -3346,21 +3376,7 @@ def page_broker(
         msg = f"{saved_n}건 반영 완료 ({source_name} → {biz} / {dom_account.name})"
         if db_dup or file_dup:
             msg += f" (DB중복 {db_dup}건, 파일중복 {file_dup}건 제외)"
-        st.success(msg)
-        if errors:
-            with st.expander(f"오류/스킵 {len(errors)}건"):
-                for e in errors:
-                    st.write(e)
-
-        positions, _, _warnings = compute_positions(
-            storage.list_trades(market=market)
-        )
-        st.write("업데이트된 잔고 요약")
-        st.dataframe(
-            positions_to_dataframe(positions),
-            use_container_width=True,
-            hide_index=True,
-        )
+        queue_ingest_done(msg, errors=errors)
 
         # 검수 상태 초기화
         for key in (
@@ -3818,16 +3834,14 @@ def page_legacy_journal(
                 force_duplicates=force_legacy_dup,
             )
 
-            st.session_state["_legacy_toast"] = True
-            st.session_state["_legacy_toast_msg"] = (
+            legacy_msg = (
                 f"✅ 기초 데이터 {saved_n}건이 '{biz}' / '{legacy_account.name}'에 등록되었습니다!"
             )
             if db_dup or file_dup:
-                st.session_state["_legacy_toast_msg"] += (
-                    f" (DB중복 {db_dup}건, 파일중복 {file_dup}건 제외)"
-                )
+                legacy_msg += f" (DB중복 {db_dup}건, 파일중복 {file_dup}건 제외)"
             if errors:
-                st.session_state["_legacy_toast_msg"] += f" (스킵 {len(errors)}건)"
+                legacy_msg += f" (스킵 {len(errors)}건)"
+            queue_ingest_done(legacy_msg, errors=errors)
 
             for key in (
                 "legacy_token",
@@ -4075,12 +4089,12 @@ def page_settings(
     mode: str = "stock",
     market: str = MARKET_DOMESTIC,
 ) -> None:
-    market = normalize_market(market)
     """사업자별 환경설정.
 
     mode='stock'  → 주식 계정과목 + 종목 거래처코드
     mode='income' → 이자·배당 계정과목 + 증권사 거래처코드
     """
+    market = normalize_market(market)
     if business_id is None:
         st.warning("사이드바에서 사업자를 선택한 뒤 환경설정을 저장해 주세요.")
         return
@@ -4409,13 +4423,10 @@ def confirm_clear_income_records_dialog(
 def page_income(storage: Storage, business_id: int | None) -> None:
     """이자·배당소득 업로드 · 조회 · 전표 다운로드."""
     render_step_guide("income")
-    st.caption(
-        "원천징수영수증 업로드 및 전표 생성. "
-        "계정과목·증권사 거래처코드는 계정코드 메뉴에서 관리합니다."
-    )
+    st.caption("계정코드는 이 화면 위에서 저장하고, 아래 전표에 바로 반영됩니다.")
+    page_settings(storage, business_id, mode="income")
 
     if business_id is None:
-        st.warning("사이드바에서 사업자를 먼저 선택해 주세요.")
         return
 
     company_name = ""
@@ -4424,6 +4435,7 @@ def page_income(storage: Storage, business_id: int | None) -> None:
             company_name = b.name
             break
 
+    st.divider()
     st.markdown("##### 원천징수영수증 업로드")
     st.caption(
         "Excel 권장 컬럼: 지급일, 지급액, 법인세, 지방소득세, 금융상품명, 증권사, 소득구분. "
@@ -4821,6 +4833,8 @@ def main() -> None:
     pending_toast = st.session_state.pop("_pending_toast", None)
     if pending_toast:
         st.toast(pending_toast)
+    if st.session_state.get(INGEST_DONE_KEY):
+        show_ingest_done_dialog()
 
     # 사이드바: 사업자 → 시장 → 작업 순서
     business_id = sidebar_business_selector(storage)

@@ -354,6 +354,9 @@ def trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
                 "통화": getattr(t, "currency", "") or "",
                 "환율": getattr(t, "fx_rate", 0) or 0,
                 "외화단가": getattr(t, "price_fx", 0) or 0,
+                "거래/정산금액": float(getattr(t, "settlement_fx", 0) or 0),
+                "외화수수료": float(getattr(t, "fee_fx", 0) or 0),
+                "외화제세금": float(getattr(t, "tax_fx", 0) or 0),
                 "정산금액": t.settlement_amount
                 if t.settlement_amount is not None
                 else (
@@ -367,7 +370,7 @@ def trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
                 "ID": t.id,
             }
         )
-    # STANDARD_COLUMNS + 표시용 원가 컬럼 + 메타
+    # 원본 엑셀(해외)과 맞춰 외화 칸을 수량 뒤에 둔다.
     display_cols = [
         "거래일자",
         "사업자",
@@ -376,6 +379,12 @@ def trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
         "증권사",
         "거래유형",
         "수량",
+        "외화단가",
+        "거래/정산금액",
+        "외화수수료",
+        "외화제세금",
+        "환율",
+        "통화",
         "거래금액(원가)",
         "단가",
         "수수료",
@@ -385,13 +394,28 @@ def trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
         "출처",
         "ID",
     ]
-    # 외화 메타는 값 있을 때만 붙임
+    fx_cols = (
+        "외화단가",
+        "거래/정산금액",
+        "외화수수료",
+        "외화제세금",
+        "환율",
+        "통화",
+    )
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=display_cols)
-    extra = [c for c in ("통화", "환율", "외화단가") if c in df.columns]
+        return pd.DataFrame(columns=[c for c in display_cols if c not in fx_cols])
+    include_fx = any(
+        float(getattr(t, "price_fx", 0) or 0) != 0
+        or float(getattr(t, "fx_rate", 0) or 0) != 0
+        or float(getattr(t, "settlement_fx", 0) or 0) != 0
+        or float(getattr(t, "fee_fx", 0) or 0) != 0
+        or normalize_currency(getattr(t, "currency", "") or "KRW") != "KRW"
+        for t in trades
+    )
     ordered = [c for c in display_cols if c in df.columns]
-    # 정산금액 앞에 외화 정보가 있으면 삽입하지 않고 뒤에 유지하지 않음 — display에만 원가 포함
+    if not include_fx:
+        ordered = [c for c in ordered if c not in fx_cols]
     return df.loc[:, ordered]
 
 
