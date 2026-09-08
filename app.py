@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import io
 import locale
 import sys
 from datetime import date
@@ -508,9 +509,14 @@ def trade_table_column_config() -> dict:
     """거래 내역 테이블 숫자 컬럼 천단위 쉼표 포맷."""
     return {
         "거래일자": st.column_config.TextColumn("거래일자"),
-        "수량": st.column_config.NumberColumn("수량", format="%g"),
+        "수량": st.column_config.NumberColumn("수량", format="%.4f"),
+        "잔여수량": st.column_config.NumberColumn("잔여수량", format="%.4f"),
         "외화단가": st.column_config.NumberColumn("외화단가", format="%.4f"),
+        "매수단가(외화)": st.column_config.NumberColumn("매수단가(외화)", format="%.4f"),
+        "매수단가(원화)": st.column_config.NumberColumn("매수단가(원화)", format="%,d 원"),
         "거래/정산금액": st.column_config.NumberColumn("거래/정산금액", format="%.4f"),
+        "거래금액(외화)": st.column_config.NumberColumn("거래금액(외화)", format="%,.4f"),
+        "거래금액(원화)": st.column_config.NumberColumn("거래금액(원화)", format="%,d 원"),
         "외화수수료": st.column_config.NumberColumn("외화수수료", format="%.4f"),
         "외화제세금": st.column_config.NumberColumn("외화제세금", format="%.4f"),
         "환율": st.column_config.NumberColumn("환율", format="%.2f"),
@@ -663,6 +669,160 @@ def _highlight_trade_type(val) -> str:
     return ""
 
 
+def _filter_trades_for_stock(
+    trades: list,
+    *,
+    stock_name: str,
+    business_name: str = "",
+    account_name: str = "",
+) -> list:
+    rows = []
+    for trade in trades or []:
+        if str(getattr(trade, "stock_name", "") or "").strip() != stock_name:
+            continue
+        if business_name and str(getattr(trade, "business_name", "") or "").strip() != business_name:
+            continue
+        if account_name and str(getattr(trade, "account_name", "") or "").strip() != account_name:
+            continue
+        rows.append(trade)
+    return rows
+
+
+def _positions_for_stock(
+    positions: list,
+    *,
+    stock_name: str,
+    business_name: str = "",
+    account_name: str = "",
+) -> list:
+    rows = []
+    for pos in positions or []:
+        if str(getattr(pos, "stock_name", "") or "").strip() != stock_name:
+            continue
+        if business_name and str(getattr(pos, "business_name", "") or "").strip() != business_name:
+            continue
+        if account_name and str(getattr(pos, "account_name", "") or "").strip() != account_name:
+            continue
+        rows.append(pos)
+    return rows
+
+
+def _xlsx_bytes(df: pd.DataFrame) -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="거래내역", index=False)
+    return bio.getvalue()
+
+
+def _trade_in_period(trade, start_s: str | None, end_s: str | None) -> bool:
+    day = str(getattr(trade, "trade_date", "") or "")[:10]
+    if start_s and day < start_s:
+        return False
+    if end_s and day > end_s:
+        return False
+    return True
+
+
+def _build_stock_verify_df(trades: list, positions: list) -> pd.DataFrame:
+    """클릭 종목의 확인용 상세: FIFO 잔여수량·매수단가·거래금액."""
+    remaining: dict[int, float] = {}
+    for pos in positions or []:
+        for lot in getattr(pos, "lots", None) or []:
+            tid = int(getattr(lot, "trade_id", 0) or 0)
+            if tid:
+                remaining[tid] = float(getattr(lot, "remaining_qty", 0) or 0)
+
+    has_fx = any(
+        float(getattr(t, "price_fx", 0) or 0) != 0
+        or float(getattr(t, "settlement_fx", 0) or 0) != 0
+        or normalize_currency(getattr(t, "currency", "") or "KRW") != "KRW"
+        for t in (trades or [])
+    )
+    rows = []
+    for trade in sorted(
+        trades or [],
+        key=lambda t: (str(t.trade_date or ""), int(t.id or 0)),
+    ):
+        side = (
+            "매수"
+            if trade.side == "BUY"
+            else ("매도" if trade.side == "SELL" else "배당")
+        )
+        qty = float(trade.quantity or 0)
+        price_fx = float(getattr(trade, "price_fx", 0) or 0)
+        price = float(trade.price or 0)
+        settle_fx = abs(float(getattr(trade, "settlement_fx", 0) or 0))
+        fx_amount = settle_fx if settle_fx > 1e-12 else (qty * price_fx if price_fx else pd.NA)
+        tid = int(trade.id) if trade.id is not None else None
+        rem = remaining.get(tid) if trade.side == "BUY" and tid is not None else None
+        if trade.side == "BUY" and rem is None:
+            rem = 0.0
+        row = {
+            "ID": tid,
+            "거래일자": _normalize_trade_date(trade.trade_date) or str(trade.trade_date or ""),
+            "증권사": getattr(trade, "account_name", "") or "",
+            "종목명": getattr(trade, "stock_name", "") or "",
+            "거래유형": side,
+            "수량": qty,
+            "잔여수량": rem if trade.side == "BUY" else pd.NA,
+            "매수단가(원화)": round(price) if trade.side == "BUY" else pd.NA,
+            "거래금액(원화)": round(qty * price),
+            "단가": round(price),
+            "수수료": round(float(trade.fee or 0)),
+            "제세금": round(float(getattr(trade, "tax", 0) or 0)),
+        }
+        if has_fx:
+            row["매수단가(외화)"] = price_fx if trade.side == "BUY" and price_fx else pd.NA
+            row["거래금액(외화)"] = fx_amount
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    order = [
+        "ID",
+        "거래일자",
+        "거래유형",
+        "수량",
+        "잔여수량",
+        "매수단가(외화)",
+        "매수단가(원화)",
+        "거래금액(외화)",
+        "거래금액(원화)",
+        "단가",
+        "수수료",
+        "제세금",
+        "증권사",
+        "종목명",
+    ]
+    return df.loc[:, [c for c in order if c in df.columns]]
+
+
+def _verify_table_column_config() -> dict:
+    return {
+        "ID": st.column_config.NumberColumn("ID", format="%d", width="small"),
+        "거래일자": st.column_config.TextColumn("거래일자", width="small"),
+        "증권사": st.column_config.TextColumn("증권사", width="medium"),
+        "종목명": st.column_config.TextColumn("종목명", width="medium"),
+        "거래유형": st.column_config.TextColumn("거래유형", width="small"),
+        "수량": st.column_config.NumberColumn("수량", format="%.4f", width="small"),
+        "잔여수량": st.column_config.NumberColumn(
+            "잔여수량", format="%.4f", help="FIFO 잔여 매수 수량. 매도 행은 비움"
+        ),
+        "매수단가(외화)": st.column_config.NumberColumn("매수단가(외화)", format="%.4f"),
+        "매수단가(원화)": st.column_config.NumberColumn("매수단가(원화)", format="%,d 원"),
+        "거래금액(외화)": st.column_config.NumberColumn(
+            "거래금액(외화)", format="%.4f", help="수량 × 외화단가"
+        ),
+        "거래금액(원화)": st.column_config.NumberColumn(
+            "거래금액(원화)", format="%,d 원", help="수량 × 원화단가"
+        ),
+        "단가": st.column_config.NumberColumn("단가", format="%,d 원"),
+        "수수료": st.column_config.NumberColumn("수수료", format="%,d 원"),
+        "제세금": st.column_config.NumberColumn("제세금", format="%,d 원"),
+    }
+
+
 @st.dialog(
     "📊 종목 상세 거래 내역",
     width="large",
@@ -673,11 +833,24 @@ def show_stock_detail_modal(
     stock_name: str,
     df_stock_trades: pd.DataFrame,
     business_name: str = "",
+    stock_trades: list | None = None,
+    positions: list | None = None,
+    account_name: str = "",
+    start_date: date | None = None,
+    end_date: date | None = None,
 ) -> None:
     st.markdown(f"**종목명:** {stock_name}")
-    if business_name:
-        st.caption(f"사업자: {business_name}")
-    st.caption("증권사 원본 칸입니다. 없는 제세금·정산금액을 만들어 넣지 않습니다.")
+    meta = [p for p in (business_name, account_name) if p]
+    if meta:
+        st.caption(" · ".join(meta))
+
+    start_s = start_date.isoformat() if start_date else None
+    end_s = end_date.isoformat() if end_date else None
+    if start_s or end_s:
+        st.caption(
+            f"대시보드 조회 기간 {start_s or '시작'} ~ {end_s or '종료'}"
+        )
+        st.caption("표는 기간 내 거래입니다. 잔여수량·요약은 종료일 기준 FIFO입니다.")
 
     if df_stock_trades is None or df_stock_trades.empty:
         st.info("해당 종목의 거래 내역이 없습니다.")
@@ -686,6 +859,90 @@ def show_stock_detail_modal(
     if "ID" not in df_stock_trades.columns:
         st.error("거래 ID가 없어 일자를 수정할 수 없습니다.")
         return
+
+    as_of_trades = [
+        t for t in (stock_trades or []) if _trade_in_period(t, None, end_s)
+    ]
+    as_of_positions, _, _ = compute_positions(as_of_trades)
+    held = _positions_for_stock(
+        as_of_positions,
+        stock_name=stock_name,
+        business_name=business_name,
+        account_name=account_name,
+    ) or list(positions or [])
+    held_qty = sum(float(getattr(p, "quantity", 0) or 0) for p in held)
+    total_cost = sum(float(getattr(p, "total_cost", 0) or 0) for p in held)
+    realized = sum(float(getattr(p, "realized_pnl", 0) or 0) for p in held)
+    avg_price = (total_cost / held_qty) if held_qty > 1e-12 else 0.0
+    last_px = 0.0
+    for trade in sorted(
+        as_of_trades,
+        key=lambda t: (str(t.trade_date or ""), int(t.id or 0)),
+    ):
+        px = float(getattr(trade, "price", 0) or 0)
+        if px > 0:
+            last_px = px
+    mark_value = held_qty * last_px
+    unrealized = mark_value - total_cost
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("보유수량", f"{held_qty:,.4f} 주")
+    m2.metric("평균단가", f"{money(avg_price)} 원")
+    m3.metric("평가금액", f"{money(mark_value)} 원")
+    delta_txt = f"{unrealized:+,.0f}" if abs(unrealized) >= 0.5 else None
+    m4.metric("평가손익", f"{money(unrealized)} 원", delta=delta_txt)
+    st.caption(
+        f"원가잔액 {money(total_cost)} 원 · 평가단가 {money(last_px)} 원 "
+        f"(최근 거래 원화단가) · 누적실현손익 {money(realized)} 원"
+    )
+    st.caption(
+        "매수 행의 잔여수량·매수단가는 FIFO입니다. "
+        "매도 행의 잔여수량·매수단가는 비웁니다."
+    )
+
+    period_trades = [
+        t for t in (stock_trades or []) if _trade_in_period(t, start_s, end_s)
+    ]
+    verify = _build_stock_verify_df(period_trades, held)
+    if not verify.empty:
+        display_cols = [
+            c
+            for c in (
+                "ID",
+                "거래일자",
+                "거래유형",
+                "수량",
+                "잔여수량",
+                "매수단가(외화)",
+                "매수단가(원화)",
+                "거래금액(외화)",
+                "거래금액(원화)",
+                "단가",
+                "수수료",
+                "제세금",
+            )
+            if c in verify.columns
+        ]
+        view = verify.loc[:, display_cols]
+        styled_verify = view
+        if "거래유형" in view.columns:
+            styled_verify = view.style.map(_highlight_trade_type, subset=["거래유형"])
+        st.dataframe(
+            styled_verify,
+            use_container_width=True,
+            hide_index=True,
+            height=420,
+            column_config=_verify_table_column_config(),
+        )
+        period_tag = f"{start_s or 'all'}_{end_s or 'all'}"
+        st.download_button(
+            "엑셀 다운로드",
+            data=_xlsx_bytes(verify),
+            file_name=f"{stock_name}_거래내역_{period_tag}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"stock_verify_xlsx_{business_name}_{account_name}_{stock_name}",
+        )
 
     display_cols = _detail_source_columns(df_stock_trades)
     # 팝업 표시 직전 시간순 재정렬
@@ -701,18 +958,20 @@ def show_stock_detail_modal(
         if pd.notna(tid)
     }
 
-    # 조회용 표: 매수(빨강) / 매도(파랑) / 배당(초록)
-    view = work.loc[:, [c for c in display_cols if c in work.columns]].copy()
-    if "거래유형" in view.columns:
-        styled_df = view.style.map(_highlight_trade_type, subset=["거래유형"])
-    else:
-        styled_df = view
-    st.dataframe(
-        styled_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config=trade_table_column_config(),
-    )
+    with st.expander("증권사 원본 칸", expanded=False):
+        st.caption("증권사 원본 칸입니다. 없는 제세금·정산금액을 만들어 넣지 않습니다.")
+        view = work.loc[:, [c for c in display_cols if c in work.columns]].copy()
+        if "거래유형" in view.columns:
+            styled_df = view.style.map(_highlight_trade_type, subset=["거래유형"])
+        else:
+            styled_df = view
+        st.dataframe(
+            styled_df,
+            use_container_width=True,
+            hide_index=True,
+            height=280,
+            column_config=trade_table_column_config(),
+        )
 
     # data_editor는 Styler 색상을 지원하지 않아, 일자 수정만 별도 편집기로 유지
     with st.expander("✏️ 거래일자 수정", expanded=False):
@@ -743,7 +1002,7 @@ def show_stock_detail_modal(
                 ),
                 "ID": st.column_config.NumberColumn("ID", format="%d"),
             },
-            key=f"stock_detail_editor_{business_name}_{stock_name}",
+            key=f"stock_detail_editor_{business_name}_{account_name}_{stock_name}",
         )
 
         if st.button("💾 수정사항 저장", type="primary", use_container_width=True):
@@ -774,7 +1033,13 @@ def show_stock_detail_modal(
                 st.error(str(exc))
 
 
-def _open_stock_detail_from_query(storage: Storage, trades: list) -> None:
+def _open_stock_detail_from_query(
+    storage: Storage,
+    trades: list,
+    *,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> None:
     """세션에 쌓인 종목 상세 요청(_pending_stock_detail)으로 모달을 연다.
 
     query_params.clear()로 추가 rerun이 나더라도 pending을 pop하지 않고
@@ -789,6 +1054,7 @@ def _open_stock_detail_from_query(storage: Storage, trades: list) -> None:
 
     stock_name = str(pending.get("stock") or "").strip()
     biz_name = str(pending.get("biz") or "").strip()
+    acct_name = str(pending.get("acct") or "").strip()
     if not stock_name:
         st.session_state.pop("_pending_stock_detail", None)
         return
@@ -812,11 +1078,31 @@ def _open_stock_detail_from_query(storage: Storage, trades: list) -> None:
         stock_name=stock_name,
         business_name=biz_name,
     )
+    if acct_name and "증권사" in detail.columns:
+        detail = detail[detail["증권사"].astype(str) == acct_name].copy()
+    stock_trades = _filter_trades_for_stock(
+        trades,
+        stock_name=stock_name,
+        business_name=biz_name,
+        account_name=acct_name,
+    )
+    all_positions, _, _ = compute_positions(trades)
+    matched_pos = _positions_for_stock(
+        all_positions,
+        stock_name=stock_name,
+        business_name=biz_name,
+        account_name=acct_name,
+    )
     show_stock_detail_modal(
         storage,
         stock_name,
         detail,
         business_name=biz_name,
+        stock_trades=stock_trades,
+        positions=matched_pos,
+        account_name=acct_name,
+        start_date=start_date,
+        end_date=end_date,
     )
 
 
@@ -854,6 +1140,9 @@ def _render_holdings_html_table(
         )
         if biz:
             href += f"&biz={quote(biz)}"
+        broker = str(row.get("증권사", "")).strip()
+        if broker:
+            href += f"&acct={quote(broker)}"
         active_bid = st.session_state.get("active_business_id")
         if active_bid is not None:
             href += f"&business_id={int(active_bid)}"
@@ -867,7 +1156,6 @@ def _render_holdings_html_table(
             f'<a href="{html.escape(href)}" target="_self">'
             f"{html.escape(stock or '-')}</a>"
         )
-        broker = str(row.get("증권사", "")).strip()
         rows.append(
             "<tr>"
             f"<td class='stock'>{stock_link}</td>"
@@ -1251,10 +1539,12 @@ def consume_stock_click_query() -> None:
     elif kept_business_id and kept_business_id.isdigit():
         st.session_state.active_business_id = int(kept_business_id)
 
+    acct_name = str(st.query_params.get("acct", "") or "").strip()
     if stock_name:
         st.session_state["_pending_stock_detail"] = {
             "stock": stock_name,
             "biz": biz_name,
+            "acct": acct_name,
             "menu": st.session_state.get("active_menu"),
             "market": market_raw or (
                 menu_market(st.session_state.get("active_menu", "")) or ""
@@ -1262,7 +1552,7 @@ def consume_stock_click_query() -> None:
         }
 
     # 종목 클릭 일회성 파라미터만 제거 (menu / market_type / business_id 유지)
-    for key in ("stock", "biz", "market"):
+    for key in ("stock", "biz", "acct", "market"):
         if key in st.query_params:
             del st.query_params[key]
     if kept_business_id and str(st.query_params.get("business_id", "") or "") != kept_business_id:
@@ -1836,7 +2126,9 @@ def page_dashboard(
             "회계전표 매수분개에는 다시 넣지 않습니다."
         )
 
-    _open_stock_detail_from_query(storage, trades)
+    _open_stock_detail_from_query(
+        storage, trades, start_date=start_date, end_date=end_date
+    )
 
     start_s = start_date.isoformat()
     end_s = end_date.isoformat()
