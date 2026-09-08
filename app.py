@@ -964,10 +964,10 @@ WORK_MENU_ITEMS = [
     ("ingest", "2. 거래 넣기"),
     ("ledger", "3. 잔고·손익"),
     ("voucher", "4. 회계전표"),
+    ("codes", "5. 계정코드"),
 ]
 EXTRA_MENU_ITEMS = [
     ("income", "이자·배당"),
-    ("codes", "계정코드"),
 ]
 WORK_MENU_KEYS = {k for k, _ in WORK_MENU_ITEMS}
 MARKET_MENU_KEYS = WORK_MENU_KEYS | {"codes"}
@@ -989,7 +989,7 @@ MENU_PAGE_META: dict[str, tuple[str, str]] = {
     "ledger": ("잔고·손익", "보유 잔고 · FIFO · 처분손익"),
     "voucher": ("회계전표", "기간별 전표 다운로드"),
     "income": ("이자·배당소득", "원천징수 업로드 · 전표"),
-    "codes": ("계정코드", "전표용 계정과목 · 거래처코드"),
+    "codes": ("계정코드", "전표에 넣을 계정과목·거래처코드"),
 }
 
 STEP_GUIDES: dict[str, tuple[str, str, str, str]] = {
@@ -1024,8 +1024,8 @@ STEP_GUIDES: dict[str, tuple[str, str, str, str]] = {
         "계정코드",
     ),
     "codes": (
-        "계정코드",
-        "전표에 들어갈 계정과목과 거래처코드를 저장합니다.",
+        "5/5 계정코드",
+        "회계전표에 들어갈 투자유가증권·수수료·예금·처분손익 계정코드와 거래처코드를 저장합니다. 국내/해외를 위에서 바꾼 뒤 각각 저장하세요.",
         "voucher",
         "회계전표로",
     ),
@@ -1696,7 +1696,7 @@ def sidebar_tree_menu() -> str:
         for key, label in WORK_MENU_ITEMS:
             _sidebar_nav_button(label, key)
 
-    with st.sidebar.expander("그 외", expanded=(menu in {"income", "codes"})):
+    with st.sidebar.expander("그 외", expanded=True):
         for key, label in EXTRA_MENU_ITEMS:
             _sidebar_nav_button(label, key)
 
@@ -1767,6 +1767,10 @@ def page_ingest(
 
 def page_codes(storage: Storage, business_id: int | None) -> None:
     render_step_guide("codes")
+    st.caption(
+        f"지금 시장: **{market_label(current_market())}**. "
+        "국내/해외 계정코드는 사이드바에서 시장을 바꾼 뒤 따로 저장합니다."
+    )
     kind = st.radio(
         "대상",
         ["주식 매매", "이자·배당"],
@@ -2503,6 +2507,24 @@ def page_voucher(
     st.caption(f"시장: **{market_label(market)}**")
     st.subheader("회계 전표")
     business_id = st.session_state.get("active_business_id")
+    if business_id is not None:
+        cfg = storage.get_account_config(business_id, market=market)
+        code_cols = st.columns([4, 1])
+        with code_cols[0]:
+            st.caption(
+                f"이 전표에 쓰는 계정코드 · {market_label(market)} — "
+                f"투자유가증권 `{cfg.security_code}` · 수수료 `{cfg.fee_code}` · "
+                f"기타제예금 `{cfg.deposit_code}` · 처분이익 `{cfg.gain_code}` · "
+                f"처분손실 `{cfg.loss_code}`"
+            )
+        with code_cols[1]:
+            st.button(
+                "계정코드 수정",
+                use_container_width=True,
+                key="voucher_goto_codes",
+                on_click=_activate_menu,
+                args=("codes",),
+            )
     trades = storage.list_trades(business_id=business_id, market=market)
     positions, sells, _ = compute_positions(trades)
     trades_df = trades_to_dataframe(trades)
