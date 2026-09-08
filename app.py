@@ -26,7 +26,7 @@ if str(ROOT) not in sys.path:
 
 from src.brokers import detect_and_parse, list_brokers
 from src.brokers.pdf_parser import OCR_TIP, empty_trade_rows
-from src.dedupe import classify_trades, match_existing_trades
+from src.dedupe import classify_trades, trade_fingerprint
 from src.fifo import compute_positions
 from src.legacy_journal import parse_legacy_journal_excel
 from src.storage import UNASSIGNED_ACCOUNT_NAME
@@ -371,6 +371,29 @@ def render_dedupe_controls(prefix: str) -> bool:
     )
 
 
+def _match_existing_trades(incoming: list, existing: list) -> list:
+    """들어온 거래와 DB에 이미 있는 같은 거래를 짝짓는다."""
+    try:
+        from src.dedupe import match_existing_trades
+
+        return match_existing_trades(incoming, existing)
+    except ImportError:
+        pass
+    buckets: dict[tuple, list] = {}
+    for trade in existing:
+        buckets.setdefault(trade_fingerprint(trade), []).append(trade)
+    used: set[int] = set()
+    pairs: list = []
+    for trade in incoming:
+        for old in buckets.get(trade_fingerprint(trade), []):
+            oid = int(getattr(old, "id", 0) or 0)
+            if oid and oid not in used:
+                used.add(oid)
+                pairs.append((trade, old))
+                break
+    return pairs
+
+
 def save_trades_with_dedupe(
     storage: Storage,
     trades: list,
@@ -391,7 +414,7 @@ def save_trades_with_dedupe(
     classified = classify_trades(trades, existing)
     patched = 0
     if not force_duplicates:
-        for incoming, old in match_existing_trades(classified.db_duplicates, existing):
+        for incoming, old in _match_existing_trades(classified.db_duplicates, existing):
             amt = float(getattr(incoming, "settlement_fx", 0) or 0)
             if amt <= 0 or old.id is None:
                 continue
