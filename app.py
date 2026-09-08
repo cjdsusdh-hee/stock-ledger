@@ -314,11 +314,49 @@ def select_trade_account(
     return next((a for a in accounts if a.name == choice), None)
 
 
-def show_uploaded_file(up) -> None:
-    """업로드 위젯이 파일을 받았는지 바로 보여 준다."""
+def persist_uploaded_file(widget_key: str, store_key: str) -> None:
+    """업로더 on_change. Cloud가 위젯을 비워도 바이트는 남긴다."""
+    up = st.session_state.get(widget_key)
     if up is None:
         return
-    st.success(f"파일 선택됨: **{up.name}** ({int(up.size):,}바이트)")
+    try:
+        data = up.getvalue()
+    except Exception:  # noqa: BLE001
+        return
+    st.session_state[store_key] = {
+        "name": str(getattr(up, "name", None) or "upload"),
+        "size": int(getattr(up, "size", 0) or len(data)),
+        "bytes": data,
+    }
+
+
+def take_uploaded_file(widget, store_key: str) -> tuple[str | None, int, bytes | None]:
+    """위젯 또는 저장된 파일. Cloud에서 위젯이 None이 되어도 복구."""
+    if widget is not None:
+        try:
+            data = widget.getvalue()
+        except Exception:  # noqa: BLE001
+            data = None
+        if data:
+            name = str(getattr(widget, "name", None) or "upload")
+            size = int(getattr(widget, "size", 0) or len(data))
+            st.session_state[store_key] = {"name": name, "size": size, "bytes": data}
+            return name, size, data
+    saved = st.session_state.get(store_key) or {}
+    data = saved.get("bytes")
+    if data:
+        return (
+            str(saved.get("name") or "upload"),
+            int(saved.get("size") or len(data)),
+            data,
+        )
+    return None, 0, None
+
+
+def show_uploaded_file(name: str | None, size: int = 0) -> None:
+    if not name:
+        return
+    st.success(f"파일 선택됨: **{name}** ({int(size):,}바이트)")
 
 
 def render_dedupe_controls(prefix: str) -> bool:
@@ -2497,17 +2535,24 @@ def page_standard_import(
                 key=f"std_import_account_{market}",
             )
     force_dup = render_dedupe_controls(f"std_import_{market}")
-    up = st.file_uploader("매매일지 파일 업로드", type=["csv", "xlsx", "xls"], key="std_up")
-    show_uploaded_file(up)
-    if up and businesses:
+    up = st.file_uploader(
+        "매매일지 파일 업로드",
+        type=["csv", "xlsx", "xls"],
+        key="std_up",
+        on_change=persist_uploaded_file,
+        args=("std_up", "_std_up_file"),
+    )
+    up_name, up_size, up_bytes = take_uploaded_file(up, "_std_up_file")
+    show_uploaded_file(up_name, up_size)
+    if up_bytes and businesses:
         st.caption("파일이 올라갔습니다. 아래 버튼으로 등록하세요.")
         if st.button("표준 양식 일괄 등록", type="primary"):
             try:
                 if import_account is None or import_account.id is None:
                     raise ValueError("증권사/계좌를 선택하세요.")
                 count, errors = import_standard_file(
-                    up.getvalue(),
-                    up.name,
+                    up_bytes,
+                    up_name or "upload.csv",
                     storage,
                     default_business=default_biz,
                     market=market,
@@ -2536,8 +2581,10 @@ def page_broker_overseas(storage: Storage) -> None:
 
     st.subheader("해외주식 증권사 변환기")
     st.caption(
-        "미래에셋증권 해외주식 거래내역서 PDF, KB증권 증권계좌거래내역 엑셀을 "
-        "파싱한 뒤 검수·수정하여 해외주식 매매일지에 반영합니다."
+        "읽을 수 있는 파일은 **미래에셋 해외주식 거래내역서 PDF**, "
+        "**KB증권 증권계좌거래내역 엑셀**뿐입니다. "
+        "아래 증권사/계좌는 저장할 곳입니다. 메리츠 등 다른 증권사 원본은 "
+        "**표준 엑셀** 또는 **직접 입력**을 쓰세요."
     )
 
     businesses = storage.list_businesses()
@@ -2577,30 +2624,40 @@ def page_broker_overseas(storage: Storage) -> None:
         type=["pdf", "xlsx", "xls"],
         key="ov_broker_up",
         help="미래에셋 거래내역서 PDF 또는 KB증권 증권계좌거래내역 엑셀",
+        on_change=persist_uploaded_file,
+        args=("ov_broker_up", "_ov_broker_file"),
     )
-    show_uploaded_file(up)
+    up_name, up_size, up_bytes = take_uploaded_file(up, "_ov_broker_file")
+    show_uploaded_file(up_name, up_size)
 
-    if up:
-        token = f"{up.name}:{up.size}:{biz}"
+    if up_bytes and up_name:
+        token = f"{up_name}:{up_size}:{biz}"
         if st.session_state.get("ov_broker_token") != token:
-            name = up.name or ""
-            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-            with st.spinner("파일을 읽는 중…"):
-                file_bytes = up.getvalue()
-                if ext == "pdf":
-                    result = parse_mirae_overseas_pdf(file_bytes, name)
-                elif is_kb_overseas_excel(name):
-                    result = parse_kb_overseas_excel(file_bytes, name)
-                else:
-                    result = parse_kb_overseas_excel(file_bytes, name)
+            ext = up_name.rsplit(".", 1)[-1].lower() if "." in up_name else ""
+            try:
+                with st.spinner("파일을 읽는 중…"):
+                    if ext == "pdf" or up_bytes[:4] == b"%PDF":
+                        result = parse_mirae_overseas_pdf(up_bytes, up_name)
+                    else:
+                        result = parse_kb_overseas_excel(up_bytes, up_name)
                     if not (result.get("rows") or []):
-                        result = {
-                            "rows": [],
-                            "notes": [
-                                "지원 형식: 미래에셋 해외주식 PDF, KB증권 증권계좌거래내역 엑셀."
-                            ],
-                            "source": "overseas-unknown",
-                        }
+                        notes = [n for n in (result.get("notes") or []) if n]
+                        notes.extend(
+                            [
+                                f"이 파일({up_name})에서 해외주식 거래를 찾지 못했습니다.",
+                                "지원: 미래에셋 해외주식 거래내역서 PDF, KB증권 증권계좌거래내역 엑셀.",
+                                "메리츠 등 다른 증권사 원본은 표준 엑셀 또는 직접 입력을 사용하세요.",
+                            ]
+                        )
+                        result["rows"] = []
+                        result["notes"] = list(dict.fromkeys(notes))
+                        result["source"] = result.get("source") or "overseas-unknown"
+            except Exception as exc:  # noqa: BLE001
+                result = {
+                    "rows": [],
+                    "notes": [f"파일 처리 중 오류: {exc}"],
+                    "source": "overseas-error",
+                }
             st.session_state.ov_broker_token = token
             st.session_state.ov_broker_notes = result.get("notes") or []
             st.session_state.ov_broker_source = result.get("source") or "overseas"
@@ -2609,13 +2666,23 @@ def page_broker_overseas(storage: Storage) -> None:
             )
             st.session_state.pop("ov_broker_editor", None)
 
-    for note in st.session_state.get("ov_broker_notes") or []:
-        st.info(note)
-
+    notes = st.session_state.get("ov_broker_notes") or []
     df = st.session_state.get("ov_broker_df")
-    if df is None or getattr(df, "empty", True):
-        st.info("PDF 또는 엑셀을 업로드하면 파싱 미리보기가 표시됩니다.")
+    empty_df = df is None or getattr(df, "empty", True)
+    if empty_df:
+        if up_name or notes:
+            for note in notes:
+                st.error(note)
+            if not notes:
+                st.error(
+                    "파일을 받았지만 거래를 추출하지 못했습니다. "
+                    "미래에셋 해외주식 PDF 또는 KB 증권계좌거래내역 엑셀인지 확인하세요."
+                )
+        else:
+            st.info("PDF 또는 엑셀을 업로드하면 파싱 미리보기가 표시됩니다.")
         return
+    for note in notes:
+        st.info(note)
 
     st.markdown("### 파싱 미리보기 (검수 및 수정)")
     st.caption(
@@ -2859,26 +2926,27 @@ def page_broker(
         type=["csv", "xlsx", "xls", "pdf"],
         key="broker_up",
         help="CSV, Excel, PDF 거래내역/체결내역을 업로드하세요.",
+        on_change=persist_uploaded_file,
+        args=("broker_up", "_broker_file"),
     )
-    show_uploaded_file(up)
+    up_name, up_size, up_bytes = take_uploaded_file(up, "_broker_file")
+    show_uploaded_file(up_name, up_size)
 
-    if up:
-        file_ext = up.name.split(".")[-1].lower().strip()
-        file_token = f"{up.name}:{up.size}:{broker}:{biz}:{file_ext}"
+    if up_bytes and up_name:
+        file_ext = up_name.split(".")[-1].lower().strip()
+        file_token = f"{up_name}:{up_size}:{broker}:{biz}:{file_ext}"
         if st.session_state.get("broker_parse_token") != file_token:
             try:
                 with st.spinner("파일을 변환하는 중…"):
                     if file_ext not in {"csv", "xlsx", "xls", "pdf"}:
-                        # MIME/매직넘버 기반 PDF 감지
-                        raw = up.getvalue()
-                        if raw[:4] != b"%PDF":
+                        if up_bytes[:4] != b"%PDF":
                             st.error(f"지원하지 않는 파일 형식입니다: {file_ext}")
                             return
                         file_ext = "pdf"
 
                     result = detect_and_parse(
-                        up.getvalue(),
-                        up.name if file_ext != "pdf" or up.name.lower().endswith(".pdf") else f"{up.name}.pdf",
+                        up_bytes,
+                        up_name if file_ext != "pdf" or up_name.lower().endswith(".pdf") else f"{up_name}.pdf",
                         default_business=biz,
                         broker_hint=broker,
                     )
@@ -3098,16 +3166,19 @@ def page_legacy_journal(
         type=["xlsx", "xls"],
         key="legacy_up",
         help="시트마다 종목 매매일지가 있는 엑셀 파일을 업로드하세요.",
+        on_change=persist_uploaded_file,
+        args=("legacy_up", "_legacy_file"),
     )
-    show_uploaded_file(up)
+    up_name, up_size, up_bytes = take_uploaded_file(up, "_legacy_file")
+    show_uploaded_file(up_name, up_size)
 
-    if up:
-        token = f"{up.name}:{up.size}:{biz}"
+    if up_bytes and up_name:
+        token = f"{up_name}:{up_size}:{biz}"
         if st.session_state.get("legacy_token") != token:
             try:
                 with st.spinner("매매일지를 추출하는 중…"):
                     df, notes, stats = parse_legacy_journal_excel(
-                        up.getvalue(), default_business=biz
+                        up_bytes, default_business=biz
                     )
                 if "사업자" in df.columns:
                     df["사업자"] = biz
@@ -3824,13 +3895,16 @@ def page_income(storage: Storage, business_id: int | None) -> None:
         "PDF / Excel / CSV",
         type=["pdf", "xlsx", "xls", "csv"],
         key="income_uploader",
+        on_change=persist_uploaded_file,
+        args=("income_uploader", "_income_file"),
     )
-    show_uploaded_file(uploaded)
-    if uploaded is not None:
-        token = f"{uploaded.name}:{uploaded.size}"
+    up_name, up_size, up_bytes = take_uploaded_file(uploaded, "_income_file")
+    show_uploaded_file(up_name, up_size)
+    if up_bytes and up_name:
+        token = f"{up_name}:{up_size}"
         if st.session_state.get("income_upload_token") != token:
             with st.spinner("원천징수 파일을 읽는 중…"):
-                result = parse_income_file(uploaded.getvalue(), uploaded.name)
+                result = parse_income_file(up_bytes, up_name)
             for note in result.notes:
                 st.info(note)
             if result.rows:
