@@ -801,6 +801,25 @@ class Storage:
     def delete_trade(self, trade_id: int) -> None:
         self._delete("trades", eq={"id": int(trade_id)})
 
+    def update_trade_settlement_fx(
+        self,
+        trade_id: int,
+        *,
+        settlement_fx: float,
+        memo: str | None = None,
+        source: str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "settlement_fx": float(settlement_fx or 0),
+        }
+        if memo is not None:
+            payload["memo"] = memo
+        if source:
+            payload["source"] = source
+        n = self._update("trades", payload, eq={"id": int(trade_id)})
+        if n == 0:
+            raise ValueError(f"거래 ID {trade_id}를 찾을 수 없습니다.")
+
     def update_trade_date(self, trade_id: int, new_date: str) -> None:
         date_str = str(new_date or "").strip()[:10]
         if not date_str:

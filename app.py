@@ -26,7 +26,7 @@ if str(ROOT) not in sys.path:
 
 from src.brokers import detect_and_parse, list_brokers
 from src.brokers.pdf_parser import OCR_TIP, empty_trade_rows
-from src.dedupe import classify_trades
+from src.dedupe import classify_trades, match_existing_trades
 from src.fifo import compute_positions
 from src.legacy_journal import parse_legacy_journal_excel
 from src.storage import UNASSIGNED_ACCOUNT_NAME
@@ -377,20 +377,39 @@ def save_trades_with_dedupe(
     *,
     market: str,
     force_duplicates: bool,
-) -> tuple[int, int, int]:
-    """신규 등록 건수, DB중복, 파일내부중복."""
+) -> tuple[int, int, int, int]:
+    """신규 등록 건수, DB중복, 파일내부중복, 거래/정산금액 갱신 건수."""
     if not trades:
-        return 0, 0, 0
+        return 0, 0, 0, 0
+    from src.voucher_export import attach_fx_gross_memo
+
     existing = storage.list_trades(
         business_id=trades[0].business_id,
         market=market,
         account_id=getattr(trades[0], "account_id", None),
     )
     classified = classify_trades(trades, existing)
+    patched = 0
+    if not force_duplicates:
+        for incoming, old in match_existing_trades(classified.db_duplicates, existing):
+            amt = float(getattr(incoming, "settlement_fx", 0) or 0)
+            if amt <= 0 or old.id is None:
+                continue
+            old_amt = float(getattr(old, "settlement_fx", 0) or 0)
+            old_memo = str(old.memo or "")
+            if abs(old_amt - amt) < 1e-6 and "외화총액=" in old_memo:
+                continue
+            storage.update_trade_settlement_fx(
+                int(old.id),
+                settlement_fx=amt,
+                memo=attach_fx_gross_memo(old_memo or incoming.memo or "", amt),
+                source=incoming.source or old.source,
+            )
+            patched += 1
     to_save = list(trades) if force_duplicates else classified.fresh
     if to_save:
         storage.add_trades_bulk(to_save)
-    return len(to_save), classified.db_dup_count, classified.file_dup_count
+    return len(to_save), classified.db_dup_count, classified.file_dup_count, patched
 
 
 def _is_opening_trade(trade) -> bool:
@@ -2597,19 +2616,18 @@ def page_voucher(
         for s in storage.list_stocks(business_id, market=market)
         if s.id is not None
     }
-    line_count = (
-        len(
-            trades_to_voucher_lines(
-                period_trades,
-                all_sells,
-                account_config=account_config,
-                partner_by_stock_id=partner_by_stock_id,
-                remark_mode=remark_mode,
-            )
+    voucher_lines = (
+        trades_to_voucher_lines(
+            period_trades,
+            all_sells,
+            account_config=account_config,
+            partner_by_stock_id=partner_by_stock_id,
+            remark_mode=remark_mode,
         )
         if period_trades
-        else 0
+        else []
     )
+    line_count = len(voucher_lines)
 
     st.info(
         f"선택된 기간: **{start_date.isoformat()} ~ {end_date.isoformat()}** "
@@ -2646,6 +2664,27 @@ def page_voucher(
             type="primary",
             use_container_width=True,
         )
+        if voucher_lines:
+            st.markdown("##### 적요 미리보기")
+            st.caption(
+                "메리츠 앞 금액은 엑셀 거래/정산금액입니다. "
+                "20683.188처럼 수량×단가가 보이면 변환기에서 같은 엑셀을 다시 등록하세요."
+            )
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "계정과목": ln.acct_name,
+                            "거래처": ln.partner_name,
+                            "적요명": ln.summary,
+                            "금액": ln.amount,
+                        }
+                        for ln in voucher_lines
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
 def page_standard_import(
@@ -2730,7 +2769,7 @@ def page_broker_overseas(storage: Storage) -> None:
         "미래에셋 해외주식 거래내역서 PDF, KB 증권계좌거래내역 엑셀, "
         "메리츠 등 **컬럼형 해외주식 거래내역 엑셀**을 읽습니다. "
         "메리츠 적요는 `USD {거래/정산금액} / {수량}주*{단가} * {환율}` 입니다. "
-        "앞 금액은 엑셀 거래/정산금액을 그대로 넣습니다."
+        "이미 등록된 같은 거래는 삭제하지 않고 거래/정산금액만 전표에 다시 넣습니다."
     )
 
     businesses = storage.list_businesses()
@@ -2969,7 +3008,11 @@ def page_broker_overseas(storage: Storage) -> None:
                     settle = qty * price_krw - tax_krw
 
                 broker_name = str(row.get("증권사") or "")
-                src_blob = f"{broker_name} {st.session_state.get('ov_broker_source') or ''}"
+                acct_blob = ov_account.name if ov_account else ""
+                src_blob = (
+                    f"{broker_name} {acct_blob} "
+                    f"{st.session_state.get('ov_broker_source') or ''}"
+                )
                 if "kb" in src_blob.lower() or "KB증권" in src_blob:
                     ov_source = "broker:kb-overseas"
                 elif "메리츠" in src_blob or "meritz" in src_blob.lower():
@@ -3010,7 +3053,7 @@ def page_broker_overseas(storage: Storage) -> None:
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"행 {int(idx) + 1}: {exc}")
 
-        saved_n, db_dup, file_dup = save_trades_with_dedupe(
+        saved_n, db_dup, file_dup, patched = save_trades_with_dedupe(
             storage,
             trades,
             market=MARKET_OVERSEAS,
@@ -3018,6 +3061,8 @@ def page_broker_overseas(storage: Storage) -> None:
         )
         zero_fx_n = sum(1 for t in trades if float(getattr(t, "fx_rate", 0) or 0) <= 0)
         msg = f"{saved_n}건 반영 완료 → {biz} / {ov_account.name}"
+        if patched:
+            msg += f" (거래/정산금액 {patched}건 전표용으로 갱신)"
         if db_dup or file_dup:
             msg += f" (DB중복 {db_dup}건, 파일중복 {file_dup}건 제외)"
         if zero_fx_n:
@@ -3240,7 +3285,7 @@ def page_broker(
             market=market,
             account_id=int(dom_account.id),
         )
-        saved_n, db_dup, file_dup = save_trades_with_dedupe(
+        saved_n, db_dup, file_dup, _patched = save_trades_with_dedupe(
             storage,
             trades,
             market=market,
@@ -3378,7 +3423,7 @@ def page_opening_lots(
             if not trades:
                 st.warning("수량과 종목이 있는 행이 없습니다.")
                 return
-            saved_n, db_dup, file_dup = save_trades_with_dedupe(
+            saved_n, db_dup, file_dup, _patched = save_trades_with_dedupe(
                 storage,
                 trades,
                 market=market,
@@ -3714,7 +3759,7 @@ def page_legacy_journal(
                 market=market,
                 account_id=int(legacy_account.id),
             )
-            saved_n, db_dup, file_dup = save_trades_with_dedupe(
+            saved_n, db_dup, file_dup, _patched = save_trades_with_dedupe(
                 storage,
                 trades,
                 market=market,

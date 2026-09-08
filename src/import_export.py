@@ -286,7 +286,8 @@ def import_standard_file(
     account_id: int | None = None,
     skip_duplicates: bool = True,
 ) -> tuple[int, list[str]]:
-    from .dedupe import classify_trades
+    from .dedupe import classify_trades, match_existing_trades
+    from .voucher_export import attach_fx_gross_memo
 
     df = read_tabular(file_bytes, filename)
     trades, errors = dataframe_to_trades(
@@ -304,10 +305,30 @@ def import_standard_file(
             account_id=account_id,
         )
         classified = classify_trades(trades, existing)
+        from .dedupe import match_existing_trades
+        from .voucher_export import attach_fx_gross_memo
+
+        patched = 0
+        for incoming, old in match_existing_trades(classified.db_duplicates, existing):
+            amt = float(getattr(incoming, "settlement_fx", 0) or 0)
+            if amt <= 0 or old.id is None:
+                continue
+            old_amt = float(getattr(old, "settlement_fx", 0) or 0)
+            old_memo = str(old.memo or "")
+            if abs(old_amt - amt) < 1e-6 and "외화총액=" in old_memo:
+                continue
+            storage.update_trade_settlement_fx(
+                int(old.id),
+                settlement_fx=amt,
+                memo=attach_fx_gross_memo(old_memo or incoming.memo or "", amt),
+                source=incoming.source or old.source,
+            )
+            patched += 1
         skipped = classified.db_dup_count + classified.file_dup_count
         trades = classified.fresh
         if skipped:
-            errors.append(f"중복 {skipped}건은 제외했습니다.")
+            extra = f", 거래/정산금액 {patched}건 갱신" if patched else ""
+            errors.append(f"중복 {skipped}건은 제외했습니다{extra}.")
     if trades:
         storage.add_trades_bulk(trades)
     return len(trades), errors

@@ -159,14 +159,19 @@ def parse_fx_gross_from_memo(memo: str) -> float:
         return 0.0
 
 
-def _fx_gross_amount(trade: Trade) -> float:
-    """엑셀 '거래/정산금액'을 그대로 쓴다. 없을 때만 수량×단가."""
+def _stored_fx_gross(trade: Trade) -> float:
+    """엑셀 거래/정산금액만. 수량×단가 fallback 없음."""
     stored = float(getattr(trade, "settlement_fx", 0) or 0)
     if stored > 0:
         return abs(stored)
-    from_memo = parse_fx_gross_from_memo(getattr(trade, "memo", "") or "")
-    if from_memo > 0:
-        return from_memo
+    return parse_fx_gross_from_memo(getattr(trade, "memo", "") or "")
+
+
+def _fx_gross_amount(trade: Trade) -> float:
+    """엑셀 '거래/정산금액'을 그대로 쓴다. 없을 때만 수량×단가."""
+    stored = _stored_fx_gross(trade)
+    if stored > 0:
+        return stored
     qty, price_fx, _fx, _ccy = _trade_fx_parts(trade)
     return abs(qty * price_fx)
 
@@ -300,9 +305,13 @@ def build_overseas_remark_amount(
         return body
 
     if price_fx > 0 and qty > 0:
-        fx_amt = (
-            _overseas_settle_fx(trade) if use_settlement_fx else _fx_gross_amount(trade)
-        )
+        stored = _stored_fx_gross(trade)
+        if stored > 0:
+            fx_amt = stored
+        elif use_settlement_fx:
+            fx_amt = _overseas_settle_fx(trade)
+        else:
+            fx_amt = abs(qty * price_fx)
         body = (
             f"{ccy} {_fmt_num_plain(fx_amt)} / "
             f"{_fmt_qty_overseas(qty)}주*{_fmt_fx_price(price_fx)}"
