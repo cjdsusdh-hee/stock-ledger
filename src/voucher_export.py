@@ -288,11 +288,12 @@ def build_overseas_remark_amount(
     trade: Trade,
     *,
     use_settlement_fx: bool = False,
+    front: str | None = None,
 ) -> str:
-    """해외주식 전표 적요: USD {거래/정산금액} / {수량}주*{단가} * {환율}.
+    """해외주식 전표 적요: USD {앞금액} / {수량}주*{단가} * {환율}.
 
-    앞 금액은 엑셀 빨간칸(거래/정산금액) 그대로. 수량×단가로 다시 계산하지 않는다.
-    수수료·제세금·원가·손익 적요는 이 함수를 쓰지 않는다.
+    front='qty'   → 수량×단가 (매수 종목 줄)
+    front='excel' → 엑셀 거래/정산금액 (증권사 줄). 없으면 수량×단가
     """
     qty, price_fx, fx, ccy = _trade_fx_parts(trade)
     side = str(trade.side or "").upper()
@@ -305,13 +306,19 @@ def build_overseas_remark_amount(
         return body
 
     if price_fx > 0 and qty > 0:
+        qty_amt = abs(qty * price_fx)
         stored = _stored_fx_gross(trade)
-        if stored > 0:
+        mode = (front or "").strip().lower()
+        if mode == "qty":
+            fx_amt = qty_amt
+        elif mode == "excel":
+            fx_amt = stored if stored > 0 else qty_amt
+        elif stored > 0:
             fx_amt = stored
         elif use_settlement_fx:
             fx_amt = _overseas_settle_fx(trade)
         else:
-            fx_amt = abs(qty * price_fx)
+            fx_amt = qty_amt
         body = (
             f"{ccy} {_fmt_num_plain(fx_amt)} / "
             f"{_fmt_qty_overseas(qty)}주*{_fmt_fx_price(price_fx)}"
@@ -389,10 +396,9 @@ def _fee_summary(trade: Trade, remark_mode: str, *, kind: str = "fee") -> str:
 
 
 def _deposit_summary(trade: Trade, remark_mode: str, base_memo: str) -> str:
-    """기타제예금 적요. KB증권 + 옵션2만 외화정산금액(±수수료)을 쓴다.
-
-    그 외(메리츠 포함)는 매매 적요와 같고, 수수료·원가·손익 적요는 건드리지 않는다.
-    """
+    """증권사(기타제예금) 적요. 메리츠는 엑셀 거래/정산금액을 앞 금액으로 쓴다."""
+    if _is_overseas_trade(trade) and _use_amount_remark(trade, remark_mode):
+        return build_overseas_remark_amount(trade, front="excel")
     if (
         remark_mode == "amount"
         and _is_overseas_trade(trade)
@@ -495,7 +501,7 @@ def _line(
 def _trade_summary_buy(trade: Trade, remark_mode: str = "stock") -> str:
     if _is_overseas_trade(trade):
         if _use_amount_remark(trade, remark_mode):
-            return build_overseas_remark_amount(trade)
+            return build_overseas_remark_amount(trade, front="qty")
         return build_overseas_remark(trade)
     name = (trade.stock_name or trade.stock_code or "").strip()
     if remark_mode == "amount":
