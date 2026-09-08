@@ -39,9 +39,16 @@ COLUMN_ALIASES = {
     "메모": ["메모", "비고", "적요", "memo", "note"],
     "환율": ["환율", "적용환율", "적용 환율", "fx_rate", "exchange_rate"],
     "통화": ["통화", "통화코드", "currency", "ccy"],
-    "외화단가": ["외화단가", "외화가격", "price_fx"],
-    "외화수수료": ["외화수수료", "fee_fx"],
-    "외화제세금": ["외화제세금", "tax_fx"],
+            "외화단가": ["외화단가", "외화가격", "price_fx"],
+            "외화수수료": ["외화수수료", "fee_fx"],
+            "외화제세금": ["외화제세금", "tax_fx"],
+            "외화총액": [
+                "외화총액",
+                "거래/정산금액",
+                "거래／정산금액",
+                "정산금액(외화)",
+                "거래금액(외화)",
+            ],
 }
 
 
@@ -115,6 +122,7 @@ def dataframe_to_trades(
 ) -> tuple[list[Trade], list[str]]:
     """표준/유사 컬럼 DataFrame을 Trade 리스트로 변환하고 종목/사업자를 자동 생성."""
     from .models import normalize_market
+    from .voucher_export import attach_fx_gross_memo
 
     mkt = normalize_market(market)
     work = _normalize_columns(df.copy())
@@ -191,6 +199,15 @@ def dataframe_to_trades(
                 if "외화제세금" in work.columns
                 else 0.0
             )
+            settlement_fx = (
+                _to_float(row.get("외화총액", 0))
+                if "외화총액" in work.columns
+                else 0.0
+            )
+            if settlement_fx <= 0 and price_fx > 0 and qty > 0 and fx_rate > 0:
+                settlement_fx = abs(qty * price_fx)
+            if settlement_fx > 0:
+                memo = attach_fx_gross_memo(memo, settlement_fx)
             currency = "KRW"
             if "통화" in work.columns:
                 currency = normalize_currency(str(row.get("통화") or "KRW"))
@@ -247,6 +264,7 @@ def dataframe_to_trades(
                     price_fx=price_fx,
                     fee_fx=fee_fx,
                     tax_fx=tax_fx,
+                    settlement_fx=settlement_fx,
                     account_id=resolved_account_id,
                     account_name=account_name,
                     account_code=account_code,

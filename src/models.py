@@ -132,6 +132,7 @@ class Trade:
     price_fx: float = 0.0  # 외화 단가
     fee_fx: float = 0.0
     tax_fx: float = 0.0
+    settlement_fx: float = 0.0  # 엑셀 거래/정산금액. 적요 앞 금액으로 그대로 사용
     # 증권사/계좌
     account_id: int | None = None
     # join fields (optional)

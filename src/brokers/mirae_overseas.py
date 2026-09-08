@@ -337,6 +337,7 @@ _OV_PREVIEW_COLS = [
     "종목명",
     "수량",
     "외화단가",
+    "거래/정산금액",
     "외화수수료",
     "외화제세금",
     "통화코드",
@@ -352,6 +353,7 @@ _OV_PREVIEW_COLS = [
 _OV_NUM_COLS = {
     "수량",
     "외화단가",
+    "거래/정산금액",
     "외화수수료",
     "외화제세금",
     "적용환율",
@@ -360,6 +362,28 @@ _OV_NUM_COLS = {
     "원화재세금",
     "거래금액(원)",
 }
+
+
+def preview_settle_fx(row: Any, qty: float = 0.0, price_fx: float = 0.0) -> float:
+    """미리보기 행에서 엑셀 거래/정산금액을 읽는다. 없으면 수량×단가."""
+    from src.voucher_export import parse_fx_gross_from_memo
+
+    for key in ("거래/정산금액", "외화총액"):
+        try:
+            val = float(row.get(key) or 0)
+        except Exception:  # noqa: BLE001
+            val = 0.0
+        if val > 0:
+            return abs(val)
+    try:
+        from_memo = parse_fx_gross_from_memo(str(row.get("메모") or ""))
+    except Exception:  # noqa: BLE001
+        from_memo = 0.0
+    if from_memo > 0:
+        return abs(from_memo)
+    if qty > 0 and price_fx > 0:
+        return abs(qty * price_fx)
+    return 0.0
 
 
 def build_overseas_preview_memo(
@@ -387,6 +411,13 @@ def ensure_overseas_preview_columns(df):
     import pandas as pd
 
     out = df.copy() if df is not None else pd.DataFrame(columns=_OV_PREVIEW_COLS)
+    if "외화총액" in out.columns:
+        if "거래/정산금액" not in out.columns:
+            out["거래/정산금액"] = out["외화총액"]
+        else:
+            cur = pd.to_numeric(out["거래/정산금액"], errors="coerce").fillna(0.0)
+            old = pd.to_numeric(out["외화총액"], errors="coerce").fillna(0.0)
+            out["거래/정산금액"] = cur.where(cur > 0, old)
     for c in _OV_PREVIEW_COLS:
         if c not in out.columns:
             out[c] = 0.0 if c in _OV_NUM_COLS else ""
@@ -402,6 +433,7 @@ def apply_overseas_preview_fx(df):
     - 적용환율 > 0 → 외화×환율
     """
     import pandas as pd
+    from src.voucher_export import attach_fx_gross_memo
 
     out = ensure_overseas_preview_columns(df)
     for idx in out.index:
@@ -414,6 +446,8 @@ def apply_overseas_preview_fx(df):
         ticker = str(out.at[idx, "종목코드"] or "")
         ccy = str(out.at[idx, "통화코드"] or "USD")
         broker = str(out.at[idx, "증권사"] or "").strip() if "증권사" in out.columns else ""
+        gross_fx = preview_settle_fx(out.loc[idx], qty, price_fx)
+        out.at[idx, "거래/정산금액"] = float(gross_fx)
 
         out.at[idx, "적용환율"] = fx
         price_krw = price_fx * fx if fx > 0 else 0.0
@@ -431,14 +465,17 @@ def apply_overseas_preview_fx(df):
             # 외화배당
             settle = qty * price_krw - tax_krw
         out.at[idx, "거래금액(원)"] = float(round(settle, 0))
-        out.at[idx, "메모"] = build_overseas_preview_memo(
-            kind=kind,
-            ticker=ticker,
-            qty=qty,
-            price_fx=price_fx,
-            fx_rate=fx,
-            currency=ccy,
-            broker=broker,
+        out.at[idx, "메모"] = attach_fx_gross_memo(
+            build_overseas_preview_memo(
+                kind=kind,
+                ticker=ticker,
+                qty=qty,
+                price_fx=price_fx,
+                fx_rate=fx,
+                currency=ccy,
+                broker=broker,
+            ),
+            gross_fx,
         )
     return out
 

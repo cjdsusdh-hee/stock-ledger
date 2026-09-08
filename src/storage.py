@@ -41,7 +41,16 @@ def _from_row(cls: type, row: Any) -> Any:
             kwargs[f.name] = f.default_factory()  # type: ignore[misc]
         else:
             kwargs[f.name] = raw.get(f.name)
-    return cls(**kwargs)
+    obj = cls(**kwargs)
+    if cls.__name__ == "Trade":
+        stored = float(getattr(obj, "settlement_fx", 0) or 0)
+        if stored <= 0:
+            from .voucher_export import parse_fx_gross_from_memo
+
+            obj.settlement_fx = parse_fx_gross_from_memo(
+                str(getattr(obj, "memo", "") or "")
+            )
+    return obj
 
 
 class Storage:
@@ -767,6 +776,7 @@ class Storage:
             "price_fx": float(getattr(trade, "price_fx", 0) or 0),
             "fee_fx": float(getattr(trade, "fee_fx", 0) or 0),
             "tax_fx": float(getattr(trade, "tax_fx", 0) or 0),
+            "settlement_fx": float(getattr(trade, "settlement_fx", 0) or 0),
         }
         account_id = getattr(trade, "account_id", None)
         if account_id:

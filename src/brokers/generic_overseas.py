@@ -26,11 +26,61 @@ PRICE_FX_CANDS = [
     "단가",
     "가격",
 ]
-FEE_FX_CANDS = ["외화수수료", "수수료", "제비용"]
-TAX_FX_CANDS = ["외화제세금", "제세금", "세금", "거래세"]
+FEE_FX_CANDS = ["수수료(외화)", "외화수수료", "수수료", "제비용"]
+TAX_FX_CANDS = ["제세금(외화)", "외화제세금", "제세금", "세금", "거래세"]
 FX_CANDS = ["적용환율", "적용 환율", "환율", "매매환율"]
 CCY_CANDS = ["통화코드", "통화", "화폐"]
 BROKER_CANDS = ["증권사", "증권회사"]
+SETTLE_FX_CANDS = [
+    "거래/정산금액",
+    "거래／정산금액",
+    "거래정산금액",
+    "매매금액(외화)",
+    "정산금액(외화)",
+    "거래금액(외화)",
+    "외화정산금액",
+    "외화거래금액",
+    "외화총액",
+]
+PRICE_KRW_CANDS = ["거래단가(원화)", "원화단가"]
+SETTLE_KRW_CANDS = ["매매금액(원화)", "거래금액(원화)"]
+
+
+def _header_key(value: object) -> str:
+    """엑셀 헤더 비교용. 슬래시·줄바꿈·공백·괄호를 없앤다."""
+    text = str(value or "")
+    for ch in "\n\r\t /／∕|·-_()（）":
+        text = text.replace(ch, "")
+    return text.lower()
+
+
+def _find_col_key(df: pd.DataFrame, *needles: str) -> str | None:
+    """헤더를 압축한 뒤 바늘문자열이 들어있는 칸을 찾는다."""
+    wanted = [_header_key(n) for n in needles if n]
+    for col in df.columns:
+        key = _header_key(col)
+        if not key:
+            continue
+        if any(w and w in key for w in wanted):
+            return col
+    return None
+
+
+def _find_settle_fx_col(df: pd.DataFrame) -> str | None:
+    """메리츠 '거래/정산금액'처럼 슬래시·줄바꿈이 섞여도 찾는다."""
+    for col in df.columns:
+        key = _header_key(col)
+        if not key or "원화" in key:
+            continue
+        if "거래정산금액" in key:
+            return col
+        if "정산금액" in key and "거래" in key:
+            return col
+        if "매매금액" in key and "외화" in key:
+            return col
+        if "외화정산" in key or "외화총액" in key:
+            return col
+    return find_col(df, SETTLE_FX_CANDS)
 
 
 def _guess_broker(filename: str, headers: str) -> str:
@@ -43,6 +93,25 @@ def _guess_broker(filename: str, headers: str) -> str:
     if "미래에셋" in blob or "mirae" in low:
         return "미래에셋증권"
     return "해외주식"
+
+
+def looks_like_columnar_overseas_excel(file_bytes: bytes, filename: str = "") -> bool:
+    """메리츠처럼 한 행=한 건, '거래/정산금액' 칸이 있는 엑셀인지."""
+    name = filename or ""
+    low = name.lower()
+    if "메리츠" in name or "meritz" in low:
+        return True
+    if "kb" in low or "증권계좌거래" in name:
+        return False
+    for df in _read_candidates(file_bytes):
+        blob = " ".join(_header_key(c) for c in df.columns)
+        if "거래정산금액" in blob:
+            return True
+        if "거래구분" in blob and (
+            "거래단가외화" in blob or "거래수량" in blob or "매매금액외화" in blob
+        ):
+            return True
+    return False
 
 
 def _read_candidates(file_bytes: bytes) -> list[pd.DataFrame]:
@@ -65,6 +134,8 @@ def _score_frame(df: pd.DataFrame) -> int:
             hits += 1
     if find_col(df, CODE_CANDS) or find_col(df, NAME_CANDS):
         hits += 1
+    if _find_settle_fx_col(df):
+        hits += 2
     return hits
 
 
@@ -99,6 +170,13 @@ def parse_generic_overseas_excel(
     fx_c = find_col(best, FX_CANDS)
     ccy_c = find_col(best, CCY_CANDS)
     broker_c = find_col(best, BROKER_CANDS)
+    settle_c = _find_settle_fx_col(best)
+    price_krw_c = find_col(best, PRICE_KRW_CANDS) or _find_col_key(
+        best, "거래단가원화", "원화단가"
+    )
+    settle_krw_c = find_col(best, SETTLE_KRW_CANDS) or _find_col_key(
+        best, "매매금액원화", "거래금액원화"
+    )
     headers = " ".join(str(c) for c in best.columns)
     broker = ""
     if broker_c is not None:
@@ -139,6 +217,24 @@ def parse_generic_overseas_excel(
             if name.lower() in {"nan", "none"}:
                 name = ""
             kind = "해외매수" if side == "BUY" else "해외매도"
+            settle_fx = 0.0
+            if settle_c is not None:
+                settle_fx = abs(clean_number(row[settle_c]))
+            if settle_fx <= 0:
+                settle_fx = abs(qty * price)
+            fx = coerce_fx_rate(row[fx_c] if fx_c else 0)
+            if fx <= 0:
+                price_krw = clean_number(row[price_krw_c] if price_krw_c else 0)
+                if price > 0 and price_krw > 0:
+                    fx = coerce_fx_rate(round(price_krw / price, 4))
+                elif settle_fx > 0:
+                    settle_krw = clean_number(
+                        row[settle_krw_c] if settle_krw_c else 0
+                    )
+                    if settle_krw > 0:
+                        fx = coerce_fx_rate(round(settle_krw / settle_fx, 4))
+            from src.voucher_export import attach_fx_gross_memo
+
             rows.append(
                 {
                     "거래일자": date_s,
@@ -147,14 +243,16 @@ def parse_generic_overseas_excel(
                     "종목명": name or code,
                     "수량": qty,
                     "외화단가": price,
+                    "거래/정산금액": settle_fx,
+                    "외화총액": settle_fx,
                     "외화수수료": clean_number(row[fee_c] if fee_c else 0),
                     "외화제세금": clean_number(row[tax_c] if tax_c else 0),
                     "통화코드": normalize_currency(
                         str(row[ccy_c] or "USD") if ccy_c else "USD"
                     ),
-                    "적용환율": coerce_fx_rate(row[fx_c] if fx_c else 0),
+                    "적용환율": fx,
                     "증권사": broker,
-                    "메모": f"{broker} {kind}",
+                    "메모": attach_fx_gross_memo(f"{broker} {kind}", settle_fx),
                 }
             )
         except Exception:  # noqa: BLE001
@@ -165,6 +263,16 @@ def parse_generic_overseas_excel(
         + (f" ({filename})" if filename else "")
         + (f". 제외 {skipped}건." if skipped else ".")
     ]
+    if settle_c:
+        notes.append(
+            f"적요 앞 금액은 엑셀 '{str(settle_c).replace(chr(10), '/').replace(chr(13), '')}' "
+            "칸 값을 그대로 넣습니다. (수량×단가로 다시 계산하지 않습니다)"
+        )
+    else:
+        notes.append(
+            "거래/정산금액 칸을 못 찾아 수량×단가로 넣었습니다. "
+            "미리보기의 거래/정산금액을 엑셀과 대조하세요."
+        )
     if any(float(r.get("적용환율") or 0) <= 0 for r in rows):
         notes.append("환율이 비어 있는 행은 0으로 두었습니다. 미리보기에서 입력하세요.")
     return {"rows": rows, "notes": notes, "source": "generic-overseas-xlsx"}

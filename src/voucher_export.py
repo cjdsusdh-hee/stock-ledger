@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -22,6 +23,12 @@ _ACCT_NAMES = {
 }
 
 DR, CR = 3, 4  # 차변, 대변
+
+# 메모에 남긴 증권사 외화총액(거래/정산금액). 옵션2 적요 앞부분.
+_FX_GROSS_MEMO_RE = re.compile(
+    r"외화총액\s*=\s*([0-9]+(?:\.[0-9]+)?)",
+    re.IGNORECASE,
+)
 
 # 원본 xls: 헤더=10행, 데이터=11행부터, 컬럼 28개
 HEADER_ROW = 10
@@ -119,43 +126,322 @@ def _fmt_fx_rate(value: float | int | None) -> str:
     return f"{float(value or 0):.2f}"
 
 
+def _fmt_num_plain(value: float | int | None) -> str:
+    """적요용 숫자(천단위 없이, 끝 0 제거)."""
+    x = float(value or 0)
+    if abs(x - round(x)) < 1e-9:
+        return str(int(round(x)))
+    return f"{x:.6f}".rstrip("0").rstrip(".")
+
+
+def attach_fx_gross_memo(memo: str, amount_fx: float) -> str:
+    """메모에 외화총액 토큰을 넣거나 갱신한다."""
+    text = str(memo or "").strip()
+    amt = float(amount_fx or 0)
+    if amt <= 0:
+        cleaned = _FX_GROSS_MEMO_RE.sub("", text)
+        return re.sub(r"\s{2,}", " ", cleaned).strip(" |")
+    token = f"외화총액={_fmt_num_plain(amt)}"
+    if _FX_GROSS_MEMO_RE.search(text):
+        return _FX_GROSS_MEMO_RE.sub(token, text, count=1).strip()
+    if not text:
+        return token
+    return f"{text} {token}"
+
+
+def parse_fx_gross_from_memo(memo: str) -> float:
+    matched = _FX_GROSS_MEMO_RE.search(str(memo or ""))
+    if not matched:
+        return 0.0
+    try:
+        return float(matched.group(1))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fx_gross_amount(trade: Trade) -> float:
+    """엑셀 '거래/정산금액'을 그대로 쓴다. 없을 때만 수량×단가."""
+    stored = float(getattr(trade, "settlement_fx", 0) or 0)
+    if stored > 0:
+        return abs(stored)
+    from_memo = parse_fx_gross_from_memo(getattr(trade, "memo", "") or "")
+    if from_memo > 0:
+        return from_memo
+    qty, price_fx, _fx, _ccy = _trade_fx_parts(trade)
+    return abs(qty * price_fx)
+
+
 def _is_overseas_trade(trade: Trade) -> bool:
     if getattr(trade, "is_overseas", False):
+        return True
+    market = str(getattr(trade, "stock_market", "") or "")
+    if market.lower() in {"overseas", "해외", "해외주식"}:
+        return True
+    if float(getattr(trade, "price_fx", 0) or 0) > 0:
         return True
     return float(getattr(trade, "fx_rate", 0) or 0) > 0
 
 
-def build_overseas_remark(trade: Trade) -> str:
-    """해외주식 전표 적요.
+def _trade_side_label(trade: Trade) -> str:
+    side = str(trade.side or "").upper()
+    if side == "BUY":
+        return "매수"
+    if side == "SELL":
+        return "매도"
+    if side == "DIVIDEND":
+        return "배당"
+    return str(trade.side or "거래")
 
-    - 매수: `{종목} 매수 @{수량}주 * ${외화단가} * {환율}원`
-    - 매도: `{종목} 매도 @{수량}주 * ${외화단가} * {환율}원`
-    - 배당: `{종목} 배당입금 ${외화지급액} * {환율}원`
+
+def _trade_fx_parts(trade: Trade) -> tuple[float, float, float, str]:
+    """수량, 외화단가, 환율, 통화."""
+    qty = float(trade.quantity or 0)
+    price_fx = float(getattr(trade, "price_fx", 0) or 0)
+    fx = float(getattr(trade, "fx_rate", 0) or 0)
+    ccy = str(getattr(trade, "currency", "") or "").strip().upper() or "USD"
+    price_krw = float(trade.price or 0)
+    if price_fx <= 0 and fx > 0 and price_krw > 0 and ccy != "KRW":
+        price_fx = price_krw / fx
+    return qty, price_fx, fx, ccy
+
+
+def _is_meritz_trade(trade: Trade) -> bool:
+    blob = " ".join(
+        [
+            str(getattr(trade, "source", "") or ""),
+            str(getattr(trade, "account_name", "") or ""),
+            str(getattr(trade, "memo", "") or ""),
+        ]
+    )
+    return "메리츠" in blob or "meritz" in blob.lower()
+
+
+def _use_amount_remark(trade: Trade, remark_mode: str) -> bool:
+    """옵션2이거나 메리츠면 거래/정산금액을 앞 금액으로 쓰는 적요."""
+    if (remark_mode or "").strip().lower() == "amount":
+        return True
+    return _is_overseas_trade(trade) and _is_meritz_trade(trade)
+
+
+def _is_kb_trade(trade: Trade) -> bool:
+    """KB증권 거래 여부 (해외 전표 적요 분기용)."""
+    src = str(getattr(trade, "source", "") or "").lower()
+    acct = str(getattr(trade, "account_name", "") or "")
+    if "kb" in src:
+        return True
+    return "KB" in acct.upper() or "KB증권" in acct
+
+
+def _overseas_settle_fx(trade: Trade) -> float:
+    """외화정산금액 ≈ 거래금액 ± 외화수수료·제세금."""
+    qty, price_fx, fx, _ccy = _trade_fx_parts(trade)
+    fee_fx = float(getattr(trade, "fee_fx", 0) or 0)
+    tax_fx = float(getattr(trade, "tax_fx", 0) or 0)
+    if fee_fx <= 0 and fx > 0 and float(trade.fee or 0) > 0:
+        fee_fx = float(trade.fee) / fx
+    if tax_fx <= 0 and fx > 0 and float(getattr(trade, "tax", 0) or 0) > 0:
+        tax_fx = float(trade.tax) / fx
+    gross = abs(qty * price_fx)
+    side = str(trade.side or "").upper()
+    if side == "BUY":
+        return gross + abs(fee_fx) + abs(tax_fx)
+    if side == "SELL":
+        return max(0.0, gross - abs(fee_fx) - abs(tax_fx))
+    return gross
+
+
+def build_overseas_remark(trade: Trade) -> str:
+    """해외주식 전표 적요 (옵션1: 종목명 / @수량 * 단가 * 환율).
+
+    예: INVESCO NASDAQ 100 매수 / @40주 * $247.67 * 1442.00원
     """
     name = (trade.stock_name or trade.stock_code or "").strip()
-    qty = float(trade.quantity or 0)
-    fx = float(getattr(trade, "fx_rate", 0) or 0)
-    price_fx = float(getattr(trade, "price_fx", 0) or 0)
+    qty, price_fx, fx, ccy = _trade_fx_parts(trade)
     side = str(trade.side or "").upper()
+    label = _trade_side_label(trade)
 
-    if side == "BUY":
-        return (
-            f"{name} 매수 @{_fmt_qty_overseas(qty)}주"
-            f" * ${_fmt_fx_price(price_fx)} * {_fmt_fx_rate(fx)}원"
-        )
-    if side == "SELL":
-        return (
-            f"{name} 매도 @{_fmt_qty_overseas(qty)}주"
-            f" * ${_fmt_fx_price(price_fx)} * {_fmt_fx_rate(fx)}원"
-        )
     if side == "DIVIDEND":
-        # price_fx가 총액(qty=1)이거나 단가×수량인 경우를 모두 수용
         amount_usd = price_fx * (qty if qty > 0 else 1.0)
         return (
             f"{name} 배당입금 ${_fmt_fx_amount(amount_usd)}"
             f" * {_fmt_fx_rate(fx)}원"
         )
-    return f"{name} {trade.side}"
+
+    if price_fx > 0 and fx > 0:
+        if ccy == "USD":
+            px = f"${_fmt_fx_price(price_fx)}"
+        else:
+            px = f"{ccy} {_fmt_fx_price(price_fx)}"
+        return (
+            f"{name} {label} / @{_fmt_qty_overseas(qty)}주"
+            f" * {px} * {_fmt_fx_rate(fx)}원"
+        )
+    return f"{name} {label} / @{_fmt_qty_overseas(qty)}주"
+
+
+def build_overseas_remark_amount(
+    trade: Trade,
+    *,
+    use_settlement_fx: bool = False,
+) -> str:
+    """해외주식 전표 적요: USD {거래/정산금액} / {수량}주*{단가} * {환율}.
+
+    앞 금액은 엑셀 빨간칸(거래/정산금액) 그대로. 수량×단가로 다시 계산하지 않는다.
+    수수료·제세금·원가·손익 적요는 이 함수를 쓰지 않는다.
+    """
+    qty, price_fx, fx, ccy = _trade_fx_parts(trade)
+    side = str(trade.side or "").upper()
+
+    if side == "DIVIDEND":
+        amount_usd = price_fx * (qty if qty > 0 else 1.0)
+        body = f"{ccy} {_fmt_num_plain(amount_usd)}"
+        if fx > 0:
+            body += f" * {_fmt_num_plain(fx)}"
+        return body
+
+    if price_fx > 0 and qty > 0:
+        fx_amt = (
+            _overseas_settle_fx(trade) if use_settlement_fx else _fx_gross_amount(trade)
+        )
+        body = (
+            f"{ccy} {_fmt_num_plain(fx_amt)} / "
+            f"{_fmt_qty_overseas(qty)}주*{_fmt_fx_price(price_fx)}"
+        )
+        if fx > 0:
+            body += f" * {_fmt_num_plain(fx)}"
+        return body
+
+    name = (trade.stock_name or trade.stock_code or "").strip()
+    return f"{name} {_trade_side_label(trade)}"
+
+
+def _overseas_fee_tax_fx(trade: Trade) -> tuple[float, float, float, str]:
+    """외화수수료, 외화제세금, 환율, 통화. 외화 없으면 원화÷환율로 역산."""
+    _qty, _price_fx, fx, ccy = _trade_fx_parts(trade)
+    fee_fx = float(getattr(trade, "fee_fx", 0) or 0)
+    tax_fx = float(getattr(trade, "tax_fx", 0) or 0)
+    if fee_fx <= 0 and fx > 0 and float(trade.fee or 0) > 0:
+        fee_fx = float(trade.fee) / fx
+    if tax_fx <= 0 and fx > 0 and float(getattr(trade, "tax", 0) or 0) > 0:
+        tax_fx = float(trade.tax) / fx
+    return abs(fee_fx), abs(tax_fx), fx, ccy
+
+
+def build_overseas_fee_remark(
+    trade: Trade,
+    *,
+    kind: str = "fee",
+    remark_mode: str = "stock",
+) -> str:
+    """해외주식 수수료·제세금 적요 (외화·환율 포함)."""
+    fee_fx, tax_fx, fx, ccy = _overseas_fee_tax_fx(trade)
+    amt_fx = tax_fx if kind == "tax" else fee_fx
+    if amt_fx <= 0:
+        return "주식매도제세금" if kind == "tax" else (
+            "주식매도수수료" if str(trade.side or "").upper() == "SELL" else "주식매수수수료"
+        )
+
+    side = str(trade.side or "").upper()
+    if kind == "tax":
+        label = "주식매도제세금"
+    elif side == "SELL":
+        label = "주식매도수수료"
+    else:
+        label = "주식매수수수료"
+
+    if remark_mode == "amount":
+        body = f"{ccy} {_fmt_num_plain(amt_fx)}"
+        if fx > 0:
+            body += f" * {_fmt_num_plain(fx)}"
+        return body
+
+    if ccy == "USD":
+        px = f"${_fmt_fx_amount(amt_fx)}"
+    else:
+        px = f"{ccy} {_fmt_fx_amount(amt_fx)}"
+    if fx > 0:
+        return f"{label} / {px} * {_fmt_fx_rate(fx)}원"
+    return f"{label} / {px}"
+
+
+def _fee_summary(trade: Trade, remark_mode: str, *, kind: str = "fee") -> str:
+    """수수료·제세금 적요. 해외면 외화·환율 표기."""
+    if _is_overseas_trade(trade):
+        return build_overseas_fee_remark(
+            trade, kind=kind, remark_mode=remark_mode
+        )
+    if kind == "tax":
+        return "주식매도제세금"
+    return (
+        "주식매도수수료"
+        if str(trade.side or "").upper() == "SELL"
+        else "주식매수수수료"
+    )
+
+
+def _deposit_summary(trade: Trade, remark_mode: str, base_memo: str) -> str:
+    """기타제예금 적요. KB증권 + 옵션2만 외화정산금액(±수수료)을 쓴다.
+
+    그 외(메리츠 포함)는 매매 적요와 같고, 수수료·원가·손익 적요는 건드리지 않는다.
+    """
+    if (
+        remark_mode == "amount"
+        and _is_overseas_trade(trade)
+        and _is_kb_trade(trade)
+    ):
+        return build_overseas_remark_amount(trade, use_settlement_fx=True)
+    return base_memo
+
+
+def _pad_remark_by_slash(texts: list[str]) -> list[str]:
+    """옵션2 적요: '/' 앞부분만 최장 길이에 오른쪽 공백 패딩 후 재조합."""
+    cleaned = ["" if t is None else str(t) for t in texts]
+    if not cleaned:
+        return cleaned
+
+    fronts: list[str] = []
+    backs: list[str] = []
+    has_sep: list[bool] = []
+    for m in cleaned:
+        if "/" in m:
+            left, right = m.split("/", 1)
+            fronts.append(left.rstrip())
+            backs.append(right.lstrip())
+            has_sep.append(True)
+        else:
+            fronts.append(m)
+            backs.append("")
+            has_sep.append(False)
+
+    sep_lens = [len(f) for f, sep in zip(fronts, has_sep) if sep]
+    if not sep_lens:
+        return cleaned
+    max_len = max(sep_lens)
+
+    out: list[str] = []
+    for front, back, sep in zip(fronts, backs, has_sep):
+        if not sep:
+            out.append(front)
+            continue
+        out.append(front.ljust(max_len) + " / " + back)
+    return out
+
+
+def _pad_summaries(lines: list[VoucherLine]) -> list[VoucherLine]:
+    """옵션2: 매매 적요(주*)의 '/' 앞부분만 공백 패딩. 수수료·원가 적요는 제외."""
+    if not lines:
+        return lines
+    idxs = [
+        i
+        for i, ln in enumerate(lines)
+        if "/" in (ln.summary or "") and "주*" in (ln.summary or "")
+    ]
+    if not idxs:
+        return lines
+    padded = _pad_remark_by_slash([lines[i].summary or "" for i in idxs])
+    for i, text in zip(idxs, padded):
+        lines[i].summary = text
+    return lines
 
 
 def _partner_for_trade(
@@ -197,20 +483,48 @@ def _line(
     )
 
 
-def _trade_summary_buy(trade: Trade) -> str:
+def _trade_summary_buy(trade: Trade, remark_mode: str = "stock") -> str:
     if _is_overseas_trade(trade):
+        if _use_amount_remark(trade, remark_mode):
+            return build_overseas_remark_amount(trade)
         return build_overseas_remark(trade)
-    return f"주식매수 @{_fmt_num(trade.quantity)} * {_fmt_num(trade.price)}"
+    name = (trade.stock_name or trade.stock_code or "").strip()
+    if remark_mode == "amount":
+        qty = float(trade.quantity or 0)
+        price = float(trade.price or 0)
+        return (
+            f"KRW {_fmt_num_plain(qty * price)} / "
+            f"{_fmt_qty_overseas(qty)}주*{_fmt_num_plain(price)}"
+        )
+    return (
+        f"{name} 매수 / @{_fmt_qty_overseas(trade.quantity)}주"
+        f" * {_fmt_num(trade.price)}원"
+    )
 
 
-def _trade_summary_sell(trade: Trade) -> str:
+def _trade_summary_sell(trade: Trade, remark_mode: str = "stock") -> str:
     if _is_overseas_trade(trade):
+        if _use_amount_remark(trade, remark_mode):
+            return build_overseas_remark_amount(trade)
         return build_overseas_remark(trade)
-    return f"주식매도 @{_fmt_num(trade.quantity)} * {_fmt_num(trade.price)}"
+    name = (trade.stock_name or trade.stock_code or "").strip()
+    if remark_mode == "amount":
+        qty = float(trade.quantity or 0)
+        price = float(trade.price or 0)
+        return (
+            f"KRW {_fmt_num_plain(qty * price)} / "
+            f"{_fmt_qty_overseas(qty)}주*{_fmt_num_plain(price)}"
+        )
+    return (
+        f"{name} 매도 / @{_fmt_qty_overseas(trade.quantity)}주"
+        f" * {_fmt_num(trade.price)}원"
+    )
 
 
-def _trade_summary_dividend(trade: Trade) -> str:
+def _trade_summary_dividend(trade: Trade, remark_mode: str = "stock") -> str:
     if _is_overseas_trade(trade):
+        if remark_mode == "amount":
+            return build_overseas_remark_amount(trade)
         return build_overseas_remark(trade)
     name = (trade.stock_name or trade.stock_code or "").strip()
     return f"{name} 배당입금 {_fmt_num(trade.settlement_amount or trade.price)}"
@@ -220,6 +534,7 @@ def _buy_lines(
     trade: Trade,
     accounts: VoucherAccounts,
     partner_code: str,
+    remark_mode: str = "stock",
 ) -> list[VoucherLine]:
     ymd = _ymd(trade.trade_date)
     qty = trade.quantity
@@ -236,7 +551,9 @@ def _buy_lines(
     else:
         total_out = principal + fee + tax
 
-    memo = _trade_summary_buy(trade)
+    memo = _trade_summary_buy(trade, remark_mode=remark_mode)
+    deposit_memo = _deposit_summary(trade, remark_mode, memo)
+    fee_memo = _fee_summary(trade, remark_mode, kind="fee")
     lines: list[VoucherLine] = []
     for item in (
         _line(
@@ -255,7 +572,7 @@ def _buy_lines(
             partner_code=partner_code,
             partner_name=stock_name,
             amount=fee,
-            summary="주식매수수수료",
+            summary=fee_memo,
         ),
         _line(
             ymd=ymd,
@@ -264,7 +581,7 @@ def _buy_lines(
             partner_code=broker_code,
             partner_name=broker_name,
             amount=total_out,
-            summary=memo,
+            summary=deposit_memo,
         ),
     ):
         if item:
@@ -277,6 +594,7 @@ def _sell_lines(
     sell: SellResult | None,
     accounts: VoucherAccounts,
     partner_code: str,
+    remark_mode: str = "stock",
 ) -> list[VoucherLine]:
     """매도 분개: 투자유가증권 대변을 FIFO 매수 레이어별로 분할."""
     ymd = _ymd(trade.trade_date)
@@ -318,7 +636,10 @@ def _sell_lines(
     else:
         bank_in = max(gross - fee - tax, 0)
 
-    sell_memo = _trade_summary_sell(trade)
+    sell_memo = _trade_summary_sell(trade, remark_mode=remark_mode)
+    deposit_memo = _deposit_summary(trade, remark_mode, sell_memo)
+    fee_memo = _fee_summary(trade, remark_mode, kind="fee")
+    tax_memo = _fee_summary(trade, remark_mode, kind="tax")
     pnl = bank_in + fee + tax - book
 
     # 2) 기타제예금 / 수수료 / 제세금 / 처분손익
@@ -330,7 +651,7 @@ def _sell_lines(
             partner_code=broker_code,
             partner_name=broker_name,
             amount=bank_in,
-            summary=sell_memo,
+            summary=deposit_memo,
         ),
         _line(
             ymd=ymd,
@@ -339,7 +660,7 @@ def _sell_lines(
             partner_code=broker_code,
             partner_name=broker_name,
             amount=fee,
-            summary="주식매도수수료",
+            summary=fee_memo,
         ),
         _line(
             ymd=ymd,
@@ -348,7 +669,7 @@ def _sell_lines(
             partner_code=broker_code,
             partner_name=broker_name,
             amount=tax,
-            summary="주식매도제세금",
+            summary=tax_memo,
         ),
     ):
         if item:
@@ -388,25 +709,52 @@ def trades_to_voucher_lines(
     *,
     account_config: AccountConfig | None = None,
     partner_by_stock_id: Mapping[int, str] | None = None,
+    remark_mode: str = "stock",
 ) -> list[VoucherLine]:
     """
     sells는 전체 이력 FIFO 결과여야 매도 원가가 정확하다.
     trades는 전표에 포함할 기간 필터된 거래.
+    remark_mode: 'stock' | 'amount' — 전표 적요 형식.
     """
+    mode = (remark_mode or "stock").strip().lower()
+    if mode not in {"stock", "amount"}:
+        mode = "stock"
     accounts = VoucherAccounts.from_config(account_config)
-    sell_by_id = {s.trade_id: s for s in sells if s.trade_id is not None}
+    sell_by_id: dict[int, SellResult] = {}
+    for s in sells:
+        if s.trade_id is None:
+            continue
+        try:
+            sell_by_id[int(s.trade_id)] = s
+        except (TypeError, ValueError):
+            continue
     ordered = sorted(trades, key=lambda t: (t.trade_date, t.id or 0))
     lines: list[VoucherLine] = []
     for trade in ordered:
         partner = _partner_for_trade(trade, partner_by_stock_id)
         if trade.side == "DIVIDEND":
             continue
+        # 기초잔고는 이미 장부에 있는 보유분. 전표 매수분개로 다시 넣지 않는다.
+        if str(getattr(trade, "source", "") or "").strip().lower() in {
+            "opening",
+            "base",
+        }:
+            continue
+        sell = None
+        try:
+            if trade.id is not None:
+                sell = sell_by_id.get(int(trade.id))
+        except (TypeError, ValueError):
+            sell = None
         if trade.side == "BUY":
-            lines.extend(_buy_lines(trade, accounts, partner))
+            lines.extend(
+                _buy_lines(trade, accounts, partner, remark_mode=mode)
+            )
         else:
             lines.extend(
-                _sell_lines(trade, sell_by_id.get(trade.id), accounts, partner)
+                _sell_lines(trade, sell, accounts, partner, remark_mode=mode)
             )
+    _pad_summaries(lines)
     return lines
 
 
@@ -416,6 +764,7 @@ def count_voucher_lines(
     *,
     account_config: AccountConfig | None = None,
     partner_by_stock_id: Mapping[int, str] | None = None,
+    remark_mode: str = "stock",
 ) -> int:
     return len(
         trades_to_voucher_lines(
@@ -423,6 +772,7 @@ def count_voucher_lines(
             sells,
             account_config=account_config,
             partner_by_stock_id=partner_by_stock_id,
+            remark_mode=remark_mode,
         )
     )
 
@@ -496,6 +846,7 @@ def build_voucher_workbook(
     biz_reg_no: str = "",
     account_config: AccountConfig | None = None,
     partner_by_stock_id: Mapping[int, str] | None = None,
+    remark_mode: str = "stock",
 ) -> Workbook:
     wb = _load_template_workbook()
     ws = wb.active
@@ -507,13 +858,17 @@ def build_voucher_workbook(
         sells,
         account_config=account_config,
         partner_by_stock_id=partner_by_stock_id,
+        remark_mode=remark_mode,
     )
     for offset, line in enumerate(lines):
         row_idx = DATA_START_ROW + offset
         for col_idx, value in enumerate(line.as_row(), start=1):
             if value == "" or value is None:
                 continue
-            ws.cell(row=row_idx, column=col_idx, value=value)
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            # 적요 열(H) 텍스트 서식 — 옵션2 공백 패딩 유지
+            if col_idx == 8 and isinstance(value, str):
+                cell.number_format = "@"
     return wb
 
 
@@ -525,6 +880,7 @@ def export_voucher_excel_bytes(
     biz_reg_no: str = "",
     account_config: AccountConfig | None = None,
     partner_by_stock_id: Mapping[int, str] | None = None,
+    remark_mode: str = "stock",
 ) -> bytes:
     wb = build_voucher_workbook(
         trades,
@@ -533,6 +889,7 @@ def export_voucher_excel_bytes(
         biz_reg_no=biz_reg_no,
         account_config=account_config,
         partner_by_stock_id=partner_by_stock_id,
+        remark_mode=remark_mode,
     )
     buf = BytesIO()
     wb.save(buf)

@@ -92,11 +92,16 @@ def parse_kb_overseas_excel(file_bytes: bytes, filename: str = "") -> dict[str, 
         return {"rows": [], "notes": ["파일이 비어 있습니다."], "source": "kb-overseas-xlsx"}
 
     start = 0
+    found_header = False
     for i in range(min(6, len(raw) - 1)):
         if _is_header_pair(list(raw.iloc[i]), list(raw.iloc[i + 1])):
             start = i + 2
+            found_header = True
             break
-    else:
+    if not found_header:
+        # 메리츠 컬럼형 엑셀을 2행부터 억지로 읽지 않는다.
+        if not is_kb_overseas_excel(filename, raw):
+            return {"rows": [], "notes": [], "source": "kb-overseas-xlsx"}
         notes.append("헤더(거래일자·거래종류·종목명)를 찾지 못했습니다. 2행부터 읽습니다.")
         start = 2
 

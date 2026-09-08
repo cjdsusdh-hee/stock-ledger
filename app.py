@@ -61,6 +61,7 @@ now_str = _models_mod.now_str
 Storage = _storage_mod.Storage
 export_voucher_excel_bytes = _voucher_mod.export_voucher_excel_bytes
 trades_to_voucher_lines = _voucher_mod.trades_to_voucher_lines
+attach_fx_gross_memo = _voucher_mod.attach_fx_gross_memo
 parse_income_file = _income_parser_mod.parse_income_file
 rows_to_dataframe = _income_parser_mod.rows_to_dataframe
 apply_income_fx_rates = _income_parser_mod.apply_income_fx_rates
@@ -390,6 +391,86 @@ def save_trades_with_dedupe(
     if to_save:
         storage.add_trades_bulk(to_save)
     return len(to_save), classified.db_dup_count, classified.file_dup_count
+
+
+def _is_opening_trade(trade) -> bool:
+    return str(getattr(trade, "source", "") or "").strip().lower() in OPENING_TRADE_SOURCES
+
+
+def _opening_cell_str(value) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:  # noqa: BLE001
+        pass
+    text = str(value).strip()
+    if text.lower() in {"nan", "none", "nat"}:
+        return ""
+    return text
+
+
+def _opening_cell_float(value) -> float:
+    if value is None or value == "":
+        return 0.0
+    try:
+        if pd.isna(value):
+            return 0.0
+    except Exception:  # noqa: BLE001
+        pass
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    text = (
+        str(value)
+        .strip()
+        .replace(",", "")
+        .replace("주", "")
+        .replace("원", "")
+        .replace("$", "")
+    )
+    if not text:
+        return 0.0
+    return float(text)
+
+
+def _opening_cell_date(value, fallback: date) -> str:
+    from src.brokers.base import parse_trade_date
+
+    parsed = parse_trade_date(value)
+    if parsed:
+        return parsed
+    text = _opening_cell_str(value)
+    if not text:
+        return fallback.isoformat()
+    parsed = parse_trade_date(text)
+    return parsed or fallback.isoformat()
+
+
+def _blank_opening_df(market: str, n: int = 8) -> pd.DataFrame:
+    if normalize_market(market) == MARKET_OVERSEAS:
+        return pd.DataFrame(
+            {
+                "취득일": [""] * n,
+                "티커": [""] * n,
+                "종목명": [""] * n,
+                "수량": [0.0] * n,
+                "외화단가": [0.0] * n,
+                "환율": [0.0] * n,
+                "통화": ["USD"] * n,
+                "수수료(외화)": [0.0] * n,
+            }
+        )
+    return pd.DataFrame(
+        {
+            "취득일": [""] * n,
+            "종목명": [""] * n,
+            "종목코드": [""] * n,
+            "수량": [0] * n,
+            "단가": [0] * n,
+            "수수료": [0] * n,
+        }
+    )
 
 
 def trade_table_column_config() -> dict:
@@ -859,14 +940,16 @@ ALL_MENU_KEYS = MARKET_MENU_KEYS | INCOME_MENU_KEYS
 DEFAULT_MENU = "ledger"
 INGEST_METHODS = (
     "증권사 파일",
+    "기초데이터",
     "표준 엑셀",
     "예전 매매일지",
     "직접 입력",
 )
+OPENING_TRADE_SOURCES = frozenset({"opening", "base"})
 
 MENU_PAGE_META: dict[str, tuple[str, str]] = {
     "setup": ("준비", "증권사·종목 마스터"),
-    "ingest": ("거래 넣기", "파일 업로드 또는 직접 입력"),
+    "ingest": ("거래 넣기", "기초잔고 · 파일 업로드 · 직접 입력"),
     "ledger": ("잔고·손익", "보유 잔고 · FIFO · 처분손익"),
     "voucher": ("회계전표", "기간별 전표 다운로드"),
     "income": ("이자·배당소득", "원천징수 업로드 · 전표"),
@@ -882,7 +965,7 @@ STEP_GUIDES: dict[str, tuple[str, str, str, str]] = {
     ),
     "ingest": (
         "2/4 거래 넣기",
-        "증권사 원본 파일, 표준 엑셀, 예전 매매일지, 직접 입력 중 하나를 고르세요.",
+        "사용 전 보유분은 기초데이터로 넣고, 이후 거래는 증권사 파일·엑셀·직접 입력으로 넣으세요.",
         "ledger",
         "다음: 잔고·손익",
     ),
@@ -894,7 +977,7 @@ STEP_GUIDES: dict[str, tuple[str, str, str, str]] = {
     ),
     "voucher": (
         "4/4 회계전표",
-        "기간을 골라 회계 전표를 받습니다. 계정코드가 비었으면 먼저 계정코드를 저장하세요.",
+        "적요 형식과 기간을 골라 회계 전표를 받습니다. 계정코드가 비었으면 먼저 계정코드를 저장하세요.",
         "codes",
         "계정코드 확인",
     ),
@@ -1612,7 +1695,7 @@ def page_ingest(
     business_id: int | None,
     market: str = MARKET_DOMESTIC,
 ) -> None:
-    """증권사 파일 / 표준 엑셀 / 예전 매매일지 / 직접 입력."""
+    """증권사 파일 / 기초데이터 / 표준 엑셀 / 예전 매매일지 / 직접 입력."""
     market = normalize_market(market)
     render_step_guide("ingest")
     st.caption(f"시장: **{market_label(market)}**")
@@ -1629,6 +1712,12 @@ def page_ingest(
             "키움·미래에셋·DB금융·한투 CSV/Excel/PDF, 해외는 미래에셋 PDF·KB 엑셀."
         )
         page_broker(storage, market=market)
+    elif method == "기초데이터":
+        st.caption(
+            "이 프로그램을 쓰기 전에 매수해 둔 보유 수량·원가를 표에 입력합니다. "
+            "엑셀 업로드가 아닙니다."
+        )
+        page_opening_lots(storage, business_id, market=market)
     elif method == "표준 엑셀":
         st.caption("필수 컬럼: 거래일자, 종목코드, 거래유형, 수량, 단가.")
         page_standard_import(storage, market=market)
@@ -1715,6 +1804,12 @@ def page_dashboard(
     (positions, sells, warnings), trades = refresh_fifo(
         storage, business_id, market=market, account_id=account_id
     )
+    opening_n = sum(1 for t in trades if _is_opening_trade(t))
+    if opening_n:
+        st.caption(
+            f"기초잔고 **{opening_n}건**이 FIFO 원가에 포함됩니다. "
+            "회계전표 매수분개에는 다시 넣지 않습니다."
+        )
 
     _open_stock_detail_from_query(storage, trades)
 
@@ -2345,6 +2440,24 @@ def page_import_export(
     page_standard_import(storage, market=market)
 
 
+_VOUCHER_MEMO_OPTIONS: dict[str, str] = {
+    "옵션1: 종목명 / @수량 * 단가 * 환율": "stock",
+    "옵션2: USD 거래/정산금액 / 수량*단가 * 환율": "amount",
+}
+
+
+def _resolve_voucher_memo_mode(market: str, label: object | None = None) -> str:
+    """라디오·session_state에서 적요 모드(stock|amount) 확정."""
+    key = f"ie_memo_fmt_v4_{normalize_market(market)}"
+    raw = label if label is not None else st.session_state.get(key)
+    if raw in _VOUCHER_MEMO_OPTIONS:
+        return _VOUCHER_MEMO_OPTIONS[raw]
+    text = str(raw or "")
+    if "옵션2" in text or "외화총액" in text or "거래/정산" in text or "통화" in text:
+        return "amount"
+    return "stock"
+
+
 def page_voucher(
     storage: Storage,
     market: str = MARKET_DOMESTIC,
@@ -2396,6 +2509,32 @@ def page_voucher(
         "원본 '엑셀자료일반전표전송.xls' 양식(헤더 10행 유지, 11행부터 분개)에 맞춰 "
         "지정 기간 거래를 생성합니다. FIFO 원가는 전체 이력을 반영합니다."
     )
+
+    st.markdown("##### 적요 형식")
+    radio_key = f"ie_memo_fmt_v4_{market}"
+    memo_labels = list(_VOUCHER_MEMO_OPTIONS.keys())
+    memo_mode_label = st.radio(
+        "적요 형식",
+        options=memo_labels,
+        index=0,
+        horizontal=False,
+        key=radio_key,
+        label_visibility="collapsed",
+        help=(
+            "회계 전표 엑셀의 적요에 적용됩니다. "
+            "메리츠 해외주식은 옵션과 관계없이 엑셀 거래/정산금액을 앞 금액으로 씁니다."
+        ),
+    )
+    remark_mode = _resolve_voucher_memo_mode(market, memo_mode_label)
+    if normalize_market(market) == MARKET_OVERSEAS:
+        st.caption(
+            "메리츠: `USD {거래/정산금액} / {수량}주*{단가} * {환율}` "
+            "(앞 금액은 엑셀 칸 그대로, 수량×단가 재계산 없음)"
+        )
+    if remark_mode == "stock":
+        st.caption("예: INVESCO NASDAQ 100 매수 / @40주 * $247.67 * 1442.00원")
+    else:
+        st.caption("예: USD 20862.39 / 180주*115.9095 * 1441.1  (앞부분은 거래/정산금액)")
 
     today = date.today()
     # 구버전 range 키 → 분리 키 마이그레이션
@@ -2465,6 +2604,7 @@ def page_voucher(
                 all_sells,
                 account_config=account_config,
                 partner_by_stock_id=partner_by_stock_id,
+                remark_mode=remark_mode,
             )
         )
         if period_trades
@@ -2492,6 +2632,7 @@ def page_voucher(
             company_name=company_name,
             account_config=account_config,
             partner_by_stock_id=partner_by_stock_id,
+            remark_mode=remark_mode,
         )
         filename = (
             f"엑셀자료일반전표전송_주식매매_"
@@ -2571,20 +2712,25 @@ def page_standard_import(
 
 def page_broker_overseas(storage: Storage) -> None:
     """해외주식 증권사 변환기: 미래에셋 PDF · KB증권 엑셀 → 검수 후 일괄 등록."""
-    from src.brokers.generic_overseas import parse_generic_overseas_excel
+    from src.brokers.generic_overseas import (
+        looks_like_columnar_overseas_excel,
+        parse_generic_overseas_excel,
+    )
     from src.brokers.kb_overseas import parse_kb_overseas_excel
     from src.brokers.mirae_overseas import (
         apply_overseas_preview_fx,
         ensure_overseas_preview_columns,
         mirae_rows_to_preview_df,
         parse_mirae_overseas_pdf,
+        preview_settle_fx,
     )
 
     st.subheader("해외주식 증권사 변환기")
     st.caption(
         "미래에셋 해외주식 거래내역서 PDF, KB 증권계좌거래내역 엑셀, "
         "메리츠 등 **컬럼형 해외주식 거래내역 엑셀**을 읽습니다. "
-        "아래 증권사/계좌는 저장할 곳입니다."
+        "메리츠 적요는 `USD {거래/정산금액} / {수량}주*{단가} * {환율}` 입니다. "
+        "앞 금액은 엑셀 거래/정산금액을 그대로 넣습니다."
     )
 
     businesses = storage.list_businesses()
@@ -2633,13 +2779,15 @@ def page_broker_overseas(storage: Storage) -> None:
     show_uploaded_file(up_name, up_size)
 
     if up_bytes and up_name:
-        token = f"{up_name}:{up_size}:{biz}"
+        token = f"{up_name}:{up_size}:{biz}:settlefx3"
         if st.session_state.get("ov_broker_token") != token:
             ext = up_name.rsplit(".", 1)[-1].lower() if "." in up_name else ""
             try:
                 with st.spinner("파일을 읽는 중…"):
                     if ext == "pdf" or up_bytes[:4] == b"%PDF":
                         result = parse_mirae_overseas_pdf(up_bytes, up_name)
+                    elif looks_like_columnar_overseas_excel(up_bytes, up_name):
+                        result = parse_generic_overseas_excel(up_bytes, up_name)
                     else:
                         result = parse_kb_overseas_excel(up_bytes, up_name)
                         if not (result.get("rows") or []):
@@ -2666,6 +2814,8 @@ def page_broker_overseas(storage: Storage) -> None:
                 result.get("rows") or []
             )
             st.session_state.pop("ov_broker_editor", None)
+            st.session_state.pop("ov_broker_editor_v3", None)
+            st.session_state.pop("ov_broker_editor_v4", None)
 
     notes = st.session_state.get("ov_broker_notes") or []
     df = st.session_state.get("ov_broker_df")
@@ -2688,7 +2838,7 @@ def page_broker_overseas(storage: Storage) -> None:
     st.markdown("### 파싱 미리보기 (검수 및 수정)")
     st.caption(
         "적용환율이 0인 행(외화배당 등)은 **적용환율** 칸에 직접 입력하세요. "
-        "입력 즉시 원화단가·거래금액(원)·메모가 재계산됩니다."
+        "**거래/정산금액**은 엑셀 빨간칸 그대로이며, 적요 앞 금액이 됩니다."
     )
     df = ensure_overseas_preview_columns(df)
     edited = st.data_editor(
@@ -2696,7 +2846,7 @@ def page_broker_overseas(storage: Storage) -> None:
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
-        key="ov_broker_editor",
+        key="ov_broker_editor_v4",
         column_config={
             "증권사": st.column_config.TextColumn("증권사", width="small"),
             "거래유형": st.column_config.SelectboxColumn(
@@ -2706,6 +2856,11 @@ def page_broker_overseas(storage: Storage) -> None:
             ),
             "수량": st.column_config.NumberColumn("수량", format="%.4f"),
             "외화단가": st.column_config.NumberColumn("외화단가", format="%.4f"),
+            "거래/정산금액": st.column_config.NumberColumn(
+                "거래/정산금액",
+                format="%.4f",
+                help="엑셀 거래/정산금액. 적요: USD 이 금액 / 수량주*단가 * 환율",
+            ),
             "외화수수료": st.column_config.NumberColumn("외화수수료", format="%.4f"),
             "외화제세금": st.column_config.NumberColumn("외화제세금", format="%.4f"),
             "적용환율": st.column_config.NumberColumn(
@@ -2748,6 +2903,8 @@ def page_broker_overseas(storage: Storage) -> None:
     st.session_state.ov_broker_df = recalced
     if fx_changed:
         st.session_state.pop("ov_broker_editor", None)
+        st.session_state.pop("ov_broker_editor_v3", None)
+        st.session_state.pop("ov_broker_editor_v4", None)
         st.rerun()
 
     edited = recalced
@@ -2780,6 +2937,7 @@ def page_broker_overseas(storage: Storage) -> None:
                 price_fx = float(row.get("외화단가") or 0)
                 fee_fx = float(row.get("외화수수료") or 0)
                 tax_fx = float(row.get("외화제세금") or 0)
+                gross_fx = preview_settle_fx(row, qty, price_fx)
                 # 사용자가 입력한 최종 적용환율 (공란 → 0, 추정 없음)
                 fx = coerce_fx_rate(row.get("적용환율"))
                 ccy = normalize_currency(str(row.get("통화코드") or "USD"))
@@ -2810,6 +2968,20 @@ def page_broker_overseas(storage: Storage) -> None:
                 else:
                     settle = qty * price_krw - tax_krw
 
+                broker_name = str(row.get("증권사") or "")
+                src_blob = f"{broker_name} {st.session_state.get('ov_broker_source') or ''}"
+                if "kb" in src_blob.lower() or "KB증권" in src_blob:
+                    ov_source = "broker:kb-overseas"
+                elif "메리츠" in src_blob or "meritz" in src_blob.lower():
+                    ov_source = "broker:meritz-overseas"
+                elif "generic" in src_blob.lower():
+                    ov_source = "broker:overseas-xlsx"
+                else:
+                    ov_source = "broker:mirae-overseas"
+                memo = attach_fx_gross_memo(
+                    str(row.get("메모") or ov_source),
+                    gross_fx,
+                )
                 trades.append(
                     Trade(
                         id=None,
@@ -2822,18 +2994,14 @@ def page_broker_overseas(storage: Storage) -> None:
                         fee=fee_krw,
                         tax=tax_krw,
                         settlement_amount=settle,
-                        memo=str(row.get("메모") or "overseas-broker"),
-                        source=(
-                            "broker:kb-overseas"
-                            if "KB" in str(row.get("증권사") or "").upper()
-                            or "kb" in str(st.session_state.get("ov_broker_source") or "")
-                            else "broker:mirae-overseas"
-                        ),
+                        memo=memo,
+                        source=ov_source,
                         currency=ccy,
                         fx_rate=fx,
                         price_fx=price_fx,
                         fee_fx=fee_fx,
                         tax_fx=tax_fx,
+                        settlement_fx=gross_fx,
                         account_id=int(ov_account.id),
                         account_name=ov_account.name,
                         account_code=ov_account.code,
@@ -2864,6 +3032,8 @@ def page_broker_overseas(storage: Storage) -> None:
             "ov_broker_notes",
             "ov_broker_df",
             "ov_broker_editor",
+            "ov_broker_editor_v3",
+            "ov_broker_editor_v4",
             "ov_broker_source",
         ):
             st.session_state.pop(k, None)
@@ -3109,6 +3279,277 @@ def page_broker(
         st.error(str(exc))
 
 
+def page_opening_lots(
+    storage: Storage,
+    business_id: int | None,
+    market: str = MARKET_DOMESTIC,
+) -> None:
+    """프로그램 사용 전 보유분(기초잔고)을 표로 입력해 FIFO 원가로 등록."""
+    market = normalize_market(market)
+    overseas = market == MARKET_OVERSEAS
+    st.subheader("기초데이터 (사용 전 보유분)")
+    st.caption(
+        "엑셀 파일이 아니라 **지금 들고 있는 수량과 매수 원가**를 넣습니다. "
+        "같은 종목을 여러 단가로 샀으면 행을 나눠 적으면 FIFO가 맞습니다. "
+        "이후 증권사 파일로 같은 매수를 다시 올리면 수량이 중복되니 주의하세요. "
+        "회계전표에는 기초잔고 매수분개를 넣지 않습니다."
+    )
+    if business_id is None:
+        st.warning("사이드바에서 사업자를 선택한 뒤 입력해 주세요. (전체 제외)")
+        return
+
+    account = select_trade_account(
+        storage,
+        int(business_id),
+        market,
+        key=f"opening_account_{market}",
+        help_text="기초잔고가 들어 있는 증권사. FIFO 잔고는 증권사별로 분리됩니다.",
+    )
+    if account is None or account.id is None:
+        st.warning("증권사/계좌를 선택하거나 이름을 입력하세요.")
+        return
+
+    today = date.today()
+    as_of = st.date_input(
+        "기초 기준일 (취득일을 비우면 이 날짜로 넣습니다)",
+        value=date(today.year, 1, 1),
+        format="YYYY-MM-DD",
+        key=f"opening_as_of_{market}",
+        help="보통 장부를 이 프로그램으로 시작하는 날, 또는 그 전날입니다.",
+    )
+
+    editor_key = f"opening_grid_{market}_{business_id}"
+    if st.session_state.pop("_opening_reset", False):
+        st.session_state.pop(editor_key, None)
+
+    if overseas:
+        column_config = {
+            "취득일": st.column_config.TextColumn(
+                "취득일", help="비우면 위 기준일. YYYY-MM-DD"
+            ),
+            "티커": st.column_config.TextColumn("티커", help="예: SOXL"),
+            "종목명": st.column_config.TextColumn("종목명", help="비우면 티커와 같게 저장"),
+            "수량": st.column_config.NumberColumn("수량", min_value=0.0, step=1.0, format="%.4f"),
+            "외화단가": st.column_config.NumberColumn(
+                "외화단가", min_value=0.0, step=0.0001, format="%.4f"
+            ),
+            "환율": st.column_config.NumberColumn("환율", min_value=0.0, step=0.01, format="%.2f"),
+            "통화": st.column_config.SelectboxColumn(
+                "통화", options=list(FX_CURRENCIES)
+            ),
+            "수수료(외화)": st.column_config.NumberColumn(
+                "수수료(외화)", min_value=0.0, step=0.01, format="%.2f"
+            ),
+        }
+    else:
+        column_config = {
+            "취득일": st.column_config.TextColumn(
+                "취득일", help="비우면 위 기준일. YYYY-MM-DD"
+            ),
+            "종목명": st.column_config.TextColumn("종목명", required=False),
+            "종목코드": st.column_config.TextColumn("종목코드", help="모르면 비워도 됩니다"),
+            "수량": st.column_config.NumberColumn("수량", min_value=0, step=1, format="%,d"),
+            "단가": st.column_config.NumberColumn("단가", min_value=0, step=1, format="%,d 원"),
+            "수수료": st.column_config.NumberColumn(
+                "수수료", min_value=0, step=1, format="%,d 원"
+            ),
+        }
+
+    edited = st.data_editor(
+        _blank_opening_df(market),
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        column_config=column_config,
+        key=editor_key,
+    )
+
+    force_dup = render_dedupe_controls(f"opening_{market}")
+    if st.button("기초잔고 등록", type="primary", use_container_width=True):
+        try:
+            trades = _opening_df_to_trades(
+                edited,
+                storage,
+                business_id=int(business_id),
+                market=market,
+                account=account,
+                as_of=as_of,
+            )
+            if not trades:
+                st.warning("수량과 종목이 있는 행이 없습니다.")
+                return
+            saved_n, db_dup, file_dup = save_trades_with_dedupe(
+                storage,
+                trades,
+                market=market,
+                force_duplicates=force_dup,
+            )
+            msg = f"✅ 기초잔고 {saved_n}건을 '{account.name}'에 등록했습니다."
+            if db_dup or file_dup:
+                msg += f" (중복 {db_dup + file_dup}건 제외)"
+            st.session_state["_opening_toast"] = msg
+            st.session_state["_opening_reset"] = True
+            st.rerun()
+        except Exception as exc:  # noqa: BLE001
+            st.error(str(exc))
+
+    toast = st.session_state.pop("_opening_toast", None)
+    if toast:
+        st.toast(toast)
+        st.success(toast)
+
+    existing = [
+        t
+        for t in storage.list_trades(business_id=business_id, market=market)
+        if _is_opening_trade(t)
+        and (
+            getattr(t, "account_id", None) is None
+            or int(getattr(t, "account_id", 0) or 0) == int(account.id)
+        )
+    ]
+    st.markdown(f"##### 이미 등록된 기초잔고 (`{account.name}`)")
+    if not existing:
+        st.caption("아직 없습니다. 위 표에 종목·수량·단가를 적고 등록하세요.")
+        return
+    rows = []
+    for t in existing:
+        row = {
+            "ID": t.id,
+            "취득일": t.trade_date,
+            "종목": t.stock_name or t.stock_code,
+            "코드": t.stock_code,
+            "수량": t.quantity,
+            "단가": t.price,
+            "수수료": t.fee,
+        }
+        if overseas:
+            row["외화단가"] = getattr(t, "price_fx", 0) or 0
+            row["환율"] = getattr(t, "fx_rate", 0) or 0
+            row["통화"] = getattr(t, "currency", "") or ""
+        rows.append(row)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def _opening_df_to_trades(
+    edited: pd.DataFrame,
+    storage: Storage,
+    *,
+    business_id: int,
+    market: str,
+    account,
+    as_of: date,
+) -> list:
+    market = normalize_market(market)
+    overseas = market == MARKET_OVERSEAS
+    trades: list = []
+    errors: list[str] = []
+    if edited is None or edited.empty:
+        return trades
+
+    for idx, row in edited.iterrows():
+        row_no = int(idx) + 1 if isinstance(idx, (int, float)) else idx
+        qty = _opening_cell_float(row.get("수량"))
+        if qty <= 0:
+            continue
+        try:
+            trade_date = _opening_cell_date(row.get("취득일"), as_of)
+            if overseas:
+                ticker = _opening_cell_str(row.get("티커")).upper()
+                name = _opening_cell_str(row.get("종목명")) or ticker
+                if not ticker:
+                    raise ValueError("티커를 입력하세요.")
+                price_fx = _opening_cell_float(row.get("외화단가"))
+                fx_rate = _opening_cell_float(row.get("환율"))
+                if fx_rate <= 0:
+                    raise ValueError("환율을 입력하세요.")
+                fee_fx = _opening_cell_float(row.get("수수료(외화)"))
+                currency = normalize_currency(
+                    _opening_cell_str(row.get("통화")) or "USD"
+                )
+                stock = storage.get_or_create_stock(
+                    ticker, name, business_id=business_id, market=market
+                )
+                price_krw = _fx_to_krw(price_fx, fx_rate)
+                fee_krw = _fx_to_krw(fee_fx, fx_rate)
+                settle = qty * price_krw + fee_krw
+                trades.append(
+                    Trade(
+                        id=None,
+                        trade_date=trade_date,
+                        business_id=business_id,
+                        stock_id=int(stock.id),  # type: ignore[arg-type]
+                        side="BUY",
+                        quantity=qty,
+                        price=price_krw,
+                        fee=fee_krw,
+                        tax=0.0,
+                        settlement_amount=settle,
+                        memo="기초잔고",
+                        source="opening",
+                        created_at=now_str(),
+                        currency=currency,
+                        fx_rate=fx_rate,
+                        price_fx=price_fx,
+                        fee_fx=fee_fx,
+                        tax_fx=0.0,
+                        account_id=int(account.id),
+                        account_name=account.name,
+                        account_code=account.code,
+                        stock_code=stock.code,
+                        stock_name=stock.name,
+                    )
+                )
+                continue
+
+            name = _opening_cell_str(row.get("종목명"))
+            code = _opening_cell_str(row.get("종목코드"))
+            if not name and not code:
+                raise ValueError("종목명 또는 종목코드를 입력하세요.")
+            price = _opening_cell_float(row.get("단가"))
+            fee = _opening_cell_float(row.get("수수료"))
+            if name:
+                stock = storage.get_or_create_stock_by_name(
+                    name,
+                    code=code or None,
+                    business_id=business_id,
+                    market=market,
+                )
+            else:
+                stock = storage.get_or_create_stock(
+                    code, code, business_id=business_id, market=market
+                )
+            settle = qty * price + fee
+            trades.append(
+                Trade(
+                    id=None,
+                    trade_date=trade_date,
+                    business_id=business_id,
+                    stock_id=int(stock.id),  # type: ignore[arg-type]
+                    side="BUY",
+                    quantity=qty,
+                    price=price,
+                    fee=fee,
+                    tax=0.0,
+                    settlement_amount=settle,
+                    memo="기초잔고",
+                    source="opening",
+                    created_at=now_str(),
+                    currency="KRW",
+                    account_id=int(account.id),
+                    account_name=account.name,
+                    account_code=account.code,
+                    stock_code=stock.code,
+                    stock_name=stock.name,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{row_no}행: {exc}")
+
+    if errors:
+        raise ValueError("\n".join(errors))
+    return trades
+
+
 def page_legacy_journal(
     storage: Storage,
     business_id: int | None,
@@ -3116,10 +3557,11 @@ def page_legacy_journal(
 ) -> None:
     market = normalize_market(market)
     st.caption(f"시장: **{market_label(market)}**")
-    st.subheader("기초 데이터 등록")
+    st.subheader("예전 매매일지")
     st.caption(
         "기존 시트별 '주식 매매일지' 엑셀을 업로드하면 전 시트 거래를 추출·검수 후 "
-        "선택한 사업자로 일괄 등록합니다."
+        "선택한 사업자로 일괄 등록합니다. 프로그램 사용 전 보유분만 넣을 때는 "
+        "거래 넣기 → **기초데이터**를 쓰세요."
     )
 
     businesses = storage.list_businesses()
