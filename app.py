@@ -573,7 +573,12 @@ def _sort_trades_chronologically(df: pd.DataFrame) -> pd.DataFrame:
     drop_tmp: list[str] = []
 
     if "거래일자" in work.columns:
-        work["_sort_date"] = pd.to_datetime(work["거래일자"], errors="coerce")
+        from src.brokers.base import parse_trade_date
+
+        work["_sort_date"] = pd.to_datetime(
+            work["거래일자"].map(lambda v: parse_trade_date(v)),
+            errors="coerce",
+        )
         sort_by.append("_sort_date")
         drop_tmp.append("_sort_date")
 
@@ -625,22 +630,9 @@ DETAIL_TRADE_COLUMNS = [
 
 def _normalize_trade_date(value) -> str | None:
     """data_editor 날짜 값을 YYYY-MM-DD 문자열로 변환."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return None
-    if isinstance(value, pd.Timestamp):
-        return value.date().isoformat()
-    if hasattr(value, "isoformat") and not isinstance(value, str):
-        try:
-            return value.isoformat()[:10]
-        except Exception:  # noqa: BLE001
-            pass
-    text = str(value).strip()
-    if not text or text.lower() == "nat":
-        return None
-    parsed = pd.to_datetime(text, errors="coerce")
-    if pd.isna(parsed):
-        return None
-    return parsed.date().isoformat()
+    from src.brokers.base import parse_trade_date
+
+    return parse_trade_date(value)
 
 
 def _dismiss_stock_detail_modal() -> None:
@@ -687,7 +679,9 @@ def show_stock_detail_modal(
     # 팝업 표시 직전 시간순 재정렬
     sorted_src = _sort_trades_chronologically(df_stock_trades)
     work = sorted_src.loc[:, [c for c in [*display_cols, "ID"] if c in sorted_src.columns]].copy()
-    work["거래일자"] = pd.to_datetime(work["거래일자"], errors="coerce").dt.date
+    work["거래일자"] = [
+        _normalize_trade_date(v) for v in work["거래일자"]
+    ]
     work["ID"] = pd.to_numeric(work["ID"], errors="coerce").astype("Int64")
     original_dates = {
         int(tid): _normalize_trade_date(dt)
@@ -2845,7 +2839,7 @@ def page_broker_overseas(storage: Storage) -> None:
     show_uploaded_file(up_name, up_size)
 
     if up_bytes and up_name:
-        token = f"{up_name}:{up_size}:{biz}:settlefx3"
+        token = f"{up_name}:{up_size}:{biz}:datefix1"
         if st.session_state.get("ov_broker_token") != token:
             ext = up_name.rsplit(".", 1)[-1].lower() if "." in up_name else ""
             try:
@@ -2915,6 +2909,10 @@ def page_broker_overseas(storage: Storage) -> None:
         key="ov_broker_editor_v4",
         column_config={
             "증권사": st.column_config.TextColumn("증권사", width="small"),
+            "거래일자": st.column_config.TextColumn(
+                "거래일자",
+                help="YYYY-MM-DD. 엑셀 20260804 같은 숫자는 이 형식으로 바꿉니다.",
+            ),
             "거래유형": st.column_config.SelectboxColumn(
                 "거래유형",
                 options=["해외매수", "해외매도", "외화배당"],
@@ -3052,10 +3050,15 @@ def page_broker_overseas(storage: Storage) -> None:
                     str(row.get("메모") or ov_source),
                     gross_fx,
                 )
+                from src.brokers.base import parse_trade_date
+
+                trade_date = parse_trade_date(row.get("거래일자"))
+                if not trade_date:
+                    raise ValueError("거래일자를 확인하세요.")
                 trades.append(
                     Trade(
                         id=None,
-                        trade_date=str(row.get("거래일자") or "")[:10],
+                        trade_date=trade_date,
                         business_id=bid,
                         stock_id=int(stock.id),  # type: ignore[arg-type]
                         side=side,  # type: ignore[arg-type]

@@ -72,41 +72,60 @@ def parse_trade_date(value: Any) -> str | None:
     """엑셀 날짜. YYYYMMDD 정수(20260415)를 epoch로 읽지 않는다."""
     if value is None:
         return None
-    if isinstance(value, float) and pd.isna(value):
-        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:  # noqa: BLE001
+        pass
+    if hasattr(value, "item") and not isinstance(value, (bytes, bytearray, str)):
+        try:
+            value = value.item()
+        except Exception:  # noqa: BLE001
+            pass
+
     if isinstance(value, pd.Timestamp):
         if pd.isna(value):
+            return None
+        if int(value.year) <= 1971:
             return None
         return value.strftime("%Y-%m-%d")
     if hasattr(value, "strftime") and not isinstance(value, (int, float, str)):
         try:
-            return value.strftime("%Y-%m-%d")
+            text = value.strftime("%Y-%m-%d")
+            if text.startswith("1970") or text.startswith("1971"):
+                return None
+            return text
         except Exception:  # noqa: BLE001
             pass
 
     if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if float(value) != float(value):  # NaN
+            return None
         n = int(value)
         if 19000101 <= n <= 20991231:
             text = f"{n:08d}"
             return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
         if 1 <= n <= 80_000:
             ts = pd.to_datetime(n, unit="D", origin="1899-12-30", errors="coerce")
-            if not pd.isna(ts):
+            if not pd.isna(ts) and int(ts.year) > 1971:
                 return ts.strftime("%Y-%m-%d")
 
     text = str(value).strip()
+    if not text or text.lower() in {"nan", "nat", "none", "null"}:
+        return None
     if text.endswith(".0") and text[:-2].isdigit():
         text = text[:-2]
     digits = "".join(ch for ch in text if ch.isdigit())
     if len(digits) >= 8:
         y, m, d = digits[:4], digits[4:6], digits[6:8]
-        if 1900 <= int(y) <= 2099 and 1 <= int(m) <= 12 and 1 <= int(d) <= 31:
+        try:
+            yi, mi, di = int(y), int(m), int(d)
+        except ValueError:
+            yi = 0
+        if 1900 <= yi <= 2099 and 1 <= mi <= 12 and 1 <= di <= 31:
             return f"{y}-{m}-{d}"
-    ts = pd.to_datetime(value, errors="coerce")
-    if pd.isna(ts):
-        return None
-    # 숫자 epoch로 1970이 된 경우는 버린다
-    if ts.year <= 1971 and digits and len(digits) >= 8:
+    ts = pd.to_datetime(text, errors="coerce")
+    if pd.isna(ts) or int(ts.year) <= 1971:
         return None
     return ts.strftime("%Y-%m-%d")
 

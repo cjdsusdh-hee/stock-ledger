@@ -423,6 +423,10 @@ def ensure_overseas_preview_columns(df):
             out[c] = 0.0 if c in _OV_NUM_COLS else ""
     for c in _OV_NUM_COLS:
         out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+    if "거래일자" in out.columns:
+        from src.brokers.base import parse_trade_date
+
+        out["거래일자"] = out["거래일자"].map(lambda v: parse_trade_date(v) or "")
     return out[list(_OV_PREVIEW_COLS)]
 
 
