@@ -723,14 +723,35 @@ def _trade_in_period(trade, start_s: str | None, end_s: str | None) -> bool:
     return True
 
 
-def _build_stock_verify_df(trades: list, positions: list) -> pd.DataFrame:
-    """클릭 종목의 확인용 상세: FIFO 잔여수량·매수단가·거래금액."""
+def _running_qty_by_trade_id(trades: list) -> dict[int, float]:
+    """시간순 매수(+) / 매도(-) 누적 잔여수량. 배당은 수량을 바꾸지 않는다."""
     remaining: dict[int, float] = {}
-    for pos in positions or []:
-        for lot in getattr(pos, "lots", None) or []:
-            tid = int(getattr(lot, "trade_id", 0) or 0)
-            if tid:
-                remaining[tid] = float(getattr(lot, "remaining_qty", 0) or 0)
+    running = 0.0
+    for trade in sorted(
+        trades or [],
+        key=lambda t: (str(t.trade_date or ""), int(t.id or 0)),
+    ):
+        qty = float(getattr(trade, "quantity", 0) or 0)
+        if trade.side == "BUY":
+            running += qty
+        elif trade.side == "SELL":
+            running -= qty
+        tid = int(trade.id) if trade.id is not None else None
+        if tid is not None:
+            remaining[tid] = running
+    return remaining
+
+
+def _build_stock_verify_df(
+    trades: list,
+    positions: list,
+    *,
+    history: list | None = None,
+) -> pd.DataFrame:
+    """클릭 종목의 확인용 상세: 누적 잔여수량·매수단가·거래금액."""
+    remaining = _running_qty_by_trade_id(
+        history if history is not None else trades
+    )
 
     has_fx = any(
         float(getattr(t, "price_fx", 0) or 0) != 0
@@ -754,9 +775,7 @@ def _build_stock_verify_df(trades: list, positions: list) -> pd.DataFrame:
         settle_fx = abs(float(getattr(trade, "settlement_fx", 0) or 0))
         fx_amount = settle_fx if settle_fx > 1e-12 else (qty * price_fx if price_fx else pd.NA)
         tid = int(trade.id) if trade.id is not None else None
-        rem = remaining.get(tid) if trade.side == "BUY" and tid is not None else None
-        if trade.side == "BUY" and rem is None:
-            rem = 0.0
+        rem = remaining.get(tid) if tid is not None else pd.NA
         row = {
             "ID": tid,
             "거래일자": _normalize_trade_date(trade.trade_date) or str(trade.trade_date or ""),
@@ -764,7 +783,7 @@ def _build_stock_verify_df(trades: list, positions: list) -> pd.DataFrame:
             "종목명": getattr(trade, "stock_name", "") or "",
             "거래유형": side,
             "수량": qty,
-            "잔여수량": rem if trade.side == "BUY" else pd.NA,
+            "잔여수량": rem,
             "매수단가(원화)": round(price) if trade.side == "BUY" else pd.NA,
             "거래금액(원화)": round(qty * price),
             "단가": round(price),
@@ -807,7 +826,9 @@ def _verify_table_column_config() -> dict:
         "거래유형": st.column_config.TextColumn("거래유형", width="small"),
         "수량": st.column_config.NumberColumn("수량", format="%.4f", width="small"),
         "잔여수량": st.column_config.NumberColumn(
-            "잔여수량", format="%.4f", help="FIFO 잔여 매수 수량. 매도 행은 비움"
+            "잔여수량",
+            format="%.4f",
+            help="시간순 매수(+) / 매도(-) 누적. 그 행까지 보유 수량",
         ),
         "매수단가(외화)": st.column_config.NumberColumn("매수단가(외화)", format="%.4f"),
         "매수단가(원화)": st.column_config.NumberColumn("매수단가(원화)", format="%,d 원"),
@@ -850,7 +871,10 @@ def show_stock_detail_modal(
         st.caption(
             f"대시보드 조회 기간 {start_s or '시작'} ~ {end_s or '종료'}"
         )
-        st.caption("표는 기간 내 거래입니다. 잔여수량·요약은 종료일 기준 FIFO입니다.")
+        st.caption(
+            "표는 기간 내 거래입니다. 잔여수량은 시작 전 이력부터 매수(+)/매도(-) 누적, "
+            "요약은 종료일 기준 FIFO입니다."
+        )
 
     if df_stock_trades is None or df_stock_trades.empty:
         st.info("해당 종목의 거래 내역이 없습니다.")
@@ -896,14 +920,14 @@ def show_stock_detail_modal(
         f"(최근 거래 원화단가) · 누적실현손익 {money(realized)} 원"
     )
     st.caption(
-        "매수 행의 잔여수량·매수단가는 FIFO입니다. "
-        "매도 행의 잔여수량·매수단가는 비웁니다."
+        "잔여수량은 매수(+) / 매도(-) 누적입니다. "
+        "매수단가는 매수 행의 체결단가이며 매도 행은 비웁니다."
     )
 
     period_trades = [
         t for t in (stock_trades or []) if _trade_in_period(t, start_s, end_s)
     ]
-    verify = _build_stock_verify_df(period_trades, held)
+    verify = _build_stock_verify_df(period_trades, held, history=as_of_trades)
     if not verify.empty:
         display_cols = [
             c
