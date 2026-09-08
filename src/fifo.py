@@ -76,7 +76,11 @@ class FifoEngine:
                 sell_fee_alloc = trade.fee * ratio_sell
                 sell_fee_remaining -= sell_fee_alloc
 
-                pnl = (trade.price - lot.price) * matched - buy_fee_alloc - sell_fee_alloc
+                pnl = (
+                    (trade.price - lot.price) * matched
+                    - buy_fee_alloc
+                    - sell_fee_alloc
+                )
                 realized += pnl
 
                 matches.append(
@@ -139,7 +143,9 @@ class FifoEngine:
             )
 
         for key in sorted(all_keys, key=_sort_key):
-            active_lots = [deepcopy(lot) for lot in lots.get(key, []) if lot.remaining_qty > 1e-12]
+            active_lots = [
+                deepcopy(lot) for lot in lots.get(key, []) if lot.remaining_qty > 1e-12
+            ]
             qty = sum(lot.remaining_qty for lot in active_lots)
             total_cost = sum(lot.cost_basis for lot in active_lots)
             avg_price = (total_cost / qty) if qty > 0 else 0.0

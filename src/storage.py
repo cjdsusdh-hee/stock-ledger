@@ -42,14 +42,6 @@ def _from_row(cls: type, row: Any) -> Any:
         else:
             kwargs[f.name] = raw.get(f.name)
     obj = cls(**kwargs)
-    if cls.__name__ == "Trade":
-        stored = float(getattr(obj, "settlement_fx", 0) or 0)
-        if stored <= 0:
-            from .voucher_export import parse_fx_gross_from_memo
-
-            obj.settlement_fx = parse_fx_gross_from_memo(
-                str(getattr(obj, "memo", "") or "")
-            )
     return obj
 
 
@@ -801,24 +793,9 @@ class Storage:
     def delete_trade(self, trade_id: int) -> None:
         self._delete("trades", eq={"id": int(trade_id)})
 
-    def update_trade_settlement_fx(
-        self,
-        trade_id: int,
-        *,
-        settlement_fx: float,
-        memo: str | None = None,
-        source: str | None = None,
-    ) -> None:
-        payload: dict[str, Any] = {
-            "settlement_fx": float(settlement_fx or 0),
-        }
-        if memo is not None:
-            payload["memo"] = memo
-        if source:
-            payload["source"] = source
-        n = self._update("trades", payload, eq={"id": int(trade_id)})
-        if n == 0:
-            raise ValueError(f"거래 ID {trade_id}를 찾을 수 없습니다.")
+    def update_trade_settlement_fx(self, *args, **kwargs) -> None:
+        """기존 거래 수치 변경은 차단되어 있다."""
+        raise RuntimeError("기존 거래의 settlement_fx/memo 변경은 차단되어 있습니다.")
 
     def update_trade_date(self, trade_id: int, new_date: str) -> None:
         date_str = str(new_date or "").strip()[:10]

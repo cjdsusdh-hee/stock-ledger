@@ -55,7 +55,10 @@ def match_existing_trades(
     incoming: list[Trade],
     existing: list[Trade],
 ) -> list[tuple[Trade, Trade]]:
-    """들어온 거래와 DB에 이미 있는 같은 거래를 짝짓는다."""
+    """들어온 거래와 DB에 이미 있는 같은 거래를 짝짓는다.
+
+    조회 전용. 기존 행의 settlement_fx/memo/환율을 갱신하는 용도로 쓰지 않는다.
+    """
     buckets: dict[tuple, list[Trade]] = {}
     for trade in existing:
         buckets.setdefault(trade_fingerprint(trade), []).append(trade)

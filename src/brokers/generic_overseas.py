@@ -11,24 +11,22 @@ from src.brokers.base import clean_number, find_col, parse_trade_date
 from src.models import coerce_fx_rate, normalize_currency, normalize_side
 
 
-DATE_CANDS = ["거래일자", "체결일", "거래일", "매매일자", "일자", "날짜", "주문일"]
+DATE_CANDS = ["거래일자", "체결일자", "체결일", "거래일", "매매일자"]
 CODE_CANDS = ["종목코드", "단축코드", "종목번호", "티커", "Ticker", "Symbol"]
 NAME_CANDS = ["종목명", "종목", "종목이름", "한글종목명"]
 SIDE_CANDS = ["거래유형", "매매구분", "주문구분", "거래구분", "구분", "매수매도"]
 QTY_CANDS = ["체결수량", "거래수량", "수량", "주문수량"]
 PRICE_FX_CANDS = [
     "거래단가(외화)",
-    "거래단가",
     "외화단가",
     "외화가격",
     "체결단가",
     "체결가",
     "단가",
-    "가격",
 ]
-FEE_FX_CANDS = ["수수료(외화)", "외화수수료", "수수료", "제비용"]
-TAX_FX_CANDS = ["제세금(외화)", "외화제세금", "제세금", "세금", "거래세"]
-FX_CANDS = ["적용환율", "적용 환율", "기준환율", "환율", "매매환율"]
+FEE_FX_CANDS = ["수수료(외화)", "외화수수료"]
+TAX_FX_CANDS = ["제비용(외화)", "제세금(외화)", "외화제세금"]
+FX_CANDS = ["기준환율", "적용환율", "적용 환율", "매매환율"]
 CCY_CANDS = ["통화코드", "통화", "화폐"]
 BROKER_CANDS = ["증권사", "증권회사"]
 SETTLE_FX_CANDS = [
@@ -42,8 +40,6 @@ SETTLE_FX_CANDS = [
     "외화거래금액",
     "외화총액",
 ]
-PRICE_KRW_CANDS = ["거래단가(원화)", "원화단가"]
-SETTLE_KRW_CANDS = ["매매금액(원화)", "거래금액(원화)"]
 
 
 def _header_key(value: object) -> str:
@@ -52,18 +48,6 @@ def _header_key(value: object) -> str:
     for ch in "\n\r\t /／∕|·-_()（）":
         text = text.replace(ch, "")
     return text.lower()
-
-
-def _find_col_key(df: pd.DataFrame, *needles: str) -> str | None:
-    """헤더를 압축한 뒤 바늘문자열이 들어있는 칸을 찾는다."""
-    wanted = [_header_key(n) for n in needles if n]
-    for col in df.columns:
-        key = _header_key(col)
-        if not key:
-            continue
-        if any(w and w in key for w in wanted):
-            return col
-    return None
 
 
 def _find_settle_fx_col(df: pd.DataFrame) -> str | None:
@@ -171,12 +155,6 @@ def parse_generic_overseas_excel(
     ccy_c = find_col(best, CCY_CANDS)
     broker_c = find_col(best, BROKER_CANDS)
     settle_c = _find_settle_fx_col(best)
-    price_krw_c = find_col(best, PRICE_KRW_CANDS) or _find_col_key(
-        best, "거래단가원화", "원화단가"
-    )
-    settle_krw_c = find_col(best, SETTLE_KRW_CANDS) or _find_col_key(
-        best, "매매금액원화", "거래금액원화"
-    )
     headers = " ".join(str(c) for c in best.columns)
     broker = ""
     if broker_c is not None:
@@ -217,24 +195,16 @@ def parse_generic_overseas_excel(
             if name.lower() in {"nan", "none"}:
                 name = ""
             kind = "해외매수" if side == "BUY" else "해외매도"
+            fee_fx = clean_number(row[fee_c] if fee_c else 0)
+            tax_fx = clean_number(row[tax_c] if tax_c else 0)
             settle_fx = 0.0
             if settle_c is not None:
                 settle_fx = abs(clean_number(row[settle_c]))
-            if settle_fx <= 0:
-                settle_fx = abs(qty * price)
             fx = coerce_fx_rate(row[fx_c] if fx_c else 0)
-            if fx <= 0:
-                price_krw = clean_number(row[price_krw_c] if price_krw_c else 0)
-                if price > 0 and price_krw > 0:
-                    fx = coerce_fx_rate(round(price_krw / price, 4))
-                elif settle_fx > 0:
-                    settle_krw = clean_number(
-                        row[settle_krw_c] if settle_krw_c else 0
-                    )
-                    if settle_krw > 0:
-                        fx = coerce_fx_rate(round(settle_krw / settle_fx, 4))
-            from src.voucher_export import attach_fx_gross_memo
-
+            # 메리츠: 해외주식매수/매도 체결행은 금액·환율이 0이고, 대금행에만 거래/정산금액이 있다.
+            if settle_fx <= 0 and fee_fx <= 0 and fx <= 0:
+                skipped += 1
+                continue
             rows.append(
                 {
                     "거래일자": date_s,
@@ -245,14 +215,14 @@ def parse_generic_overseas_excel(
                     "외화단가": price,
                     "거래/정산금액": settle_fx,
                     "외화총액": settle_fx,
-                    "외화수수료": clean_number(row[fee_c] if fee_c else 0),
-                    "외화제세금": clean_number(row[tax_c] if tax_c else 0),
+                    "외화수수료": fee_fx,
+                    "외화제세금": tax_fx,
                     "통화코드": normalize_currency(
                         str(row[ccy_c] or "USD") if ccy_c else "USD"
                     ),
                     "적용환율": fx,
                     "증권사": broker,
-                    "메모": attach_fx_gross_memo(f"{broker} {kind}", settle_fx),
+                    "메모": f"{broker} {kind}".strip(),
                 }
             )
         except Exception:  # noqa: BLE001
@@ -270,8 +240,8 @@ def parse_generic_overseas_excel(
         )
     else:
         notes.append(
-            "거래/정산금액 칸을 못 찾아 수량×단가로 넣었습니다. "
-            "미리보기의 거래/정산금액을 엑셀과 대조하세요."
+            "거래/정산금액 칸을 못 찾아 비워 두었습니다. "
+            "미리보기에서 엑셀과 대조하세요. 수량×단가로 채우지 않습니다."
         )
     if any(float(r.get("적용환율") or 0) <= 0 for r in rows):
         notes.append("환율이 비어 있는 행은 0으로 두었습니다. 미리보기에서 입력하세요.")

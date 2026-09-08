@@ -146,6 +146,10 @@ class Trade:
     def is_overseas(self) -> bool:
         return float(self.fx_rate or 0) > 0 and normalize_currency(self.currency) != "KRW"
 
+    def source_settlement_fx(self) -> float:
+        """DB에 저장된 거래/정산금액. 메모·수량×단가로 채우지 않는다."""
+        return abs(float(self.settlement_fx or 0))
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 

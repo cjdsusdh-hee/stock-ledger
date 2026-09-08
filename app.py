@@ -26,8 +26,7 @@ if str(ROOT) not in sys.path:
 
 from src.brokers import detect_and_parse, list_brokers
 from src.brokers.pdf_parser import OCR_TIP, empty_trade_rows
-from src.dedupe import classify_trades, trade_fingerprint
-from src.fifo import compute_positions
+from src.dedupe import classify_trades
 from src.legacy_journal import parse_legacy_journal_excel
 from src.storage import UNASSIGNED_ACCOUNT_NAME
 
@@ -35,6 +34,7 @@ from src.storage import UNASSIGNED_ACCOUNT_NAME
 import importlib
 
 import src.models as _models_mod
+import src.fifo as _fifo_mod
 import src.storage as _storage_mod
 import src.voucher_export as _voucher_mod
 import src.income_parser as _income_parser_mod
@@ -42,6 +42,7 @@ import src.income_voucher as _income_voucher_mod
 import src.import_export as _import_export_mod
 
 _models_mod = importlib.reload(_models_mod)
+_fifo_mod = importlib.reload(_fifo_mod)
 _storage_mod = importlib.reload(_storage_mod)
 _voucher_mod = importlib.reload(_voucher_mod)
 _income_parser_mod = importlib.reload(_income_parser_mod)
@@ -58,10 +59,10 @@ normalize_market = _models_mod.normalize_market
 normalize_currency = _models_mod.normalize_currency
 coerce_fx_rate = _models_mod.coerce_fx_rate
 now_str = _models_mod.now_str
+compute_positions = _fifo_mod.compute_positions
 Storage = _storage_mod.Storage
 export_voucher_excel_bytes = _voucher_mod.export_voucher_excel_bytes
 trades_to_voucher_lines = _voucher_mod.trades_to_voucher_lines
-attach_fx_gross_memo = _voucher_mod.attach_fx_gross_memo
 parse_income_file = _income_parser_mod.parse_income_file
 rows_to_dataframe = _income_parser_mod.rows_to_dataframe
 apply_income_fx_rates = _income_parser_mod.apply_income_fx_rates
@@ -163,7 +164,7 @@ def inject_sidebar_styles() -> None:
     st.markdown(SIDEBAR_CUSTOM_CSS, unsafe_allow_html=True)
 
 
-STORAGE_CACHE_VERSION = 21  # Storage API 변경 시 증가 → 캐시 무효화
+STORAGE_CACHE_VERSION = 23  # Storage API 변경 시 증가 → 캐시 무효화
 
 
 @st.cache_resource
@@ -401,68 +402,26 @@ def render_dedupe_controls(prefix: str) -> bool:
     )
 
 
-def _match_existing_trades(incoming: list, existing: list) -> list:
-    """들어온 거래와 DB에 이미 있는 같은 거래를 짝짓는다."""
-    try:
-        from src.dedupe import match_existing_trades
-
-        return match_existing_trades(incoming, existing)
-    except ImportError:
-        pass
-    buckets: dict[tuple, list] = {}
-    for trade in existing:
-        buckets.setdefault(trade_fingerprint(trade), []).append(trade)
-    used: set[int] = set()
-    pairs: list = []
-    for trade in incoming:
-        for old in buckets.get(trade_fingerprint(trade), []):
-            oid = int(getattr(old, "id", 0) or 0)
-            if oid and oid not in used:
-                used.add(oid)
-                pairs.append((trade, old))
-                break
-    return pairs
-
-
 def save_trades_with_dedupe(
     storage: Storage,
     trades: list,
     *,
     market: str,
     force_duplicates: bool,
-) -> tuple[int, int, int, int]:
-    """신규 등록 건수, DB중복, 파일내부중복, 거래/정산금액 갱신 건수."""
+) -> tuple[int, int, int]:
+    """신규 등록 건수, DB중복, 파일내부중복. 기존 행은 수정하지 않는다."""
     if not trades:
-        return 0, 0, 0, 0
-    from src.voucher_export import attach_fx_gross_memo
-
+        return 0, 0, 0
     existing = storage.list_trades(
         business_id=trades[0].business_id,
         market=market,
         account_id=getattr(trades[0], "account_id", None),
     )
     classified = classify_trades(trades, existing)
-    patched = 0
-    if not force_duplicates:
-        for incoming, old in _match_existing_trades(classified.db_duplicates, existing):
-            amt = float(getattr(incoming, "settlement_fx", 0) or 0)
-            if amt <= 0 or old.id is None:
-                continue
-            old_amt = float(getattr(old, "settlement_fx", 0) or 0)
-            old_memo = str(old.memo or "")
-            if abs(old_amt - amt) < 1e-6 and "외화총액=" in old_memo:
-                continue
-            storage.update_trade_settlement_fx(
-                int(old.id),
-                settlement_fx=amt,
-                memo=attach_fx_gross_memo(old_memo or incoming.memo or "", amt),
-                source=incoming.source or old.source,
-            )
-            patched += 1
     to_save = list(trades) if force_duplicates else classified.fresh
     if to_save:
         storage.add_trades_bulk(to_save)
-    return len(to_save), classified.db_dup_count, classified.file_dup_count, patched
+    return len(to_save), classified.db_dup_count, classified.file_dup_count
 
 
 def _is_opening_trade(trade) -> bool:
@@ -580,13 +539,8 @@ def _filter_stock_trades(
         detail = detail[detail["종목명"].astype(str) == stock_name]
     if business_name and "사업자" in detail.columns:
         detail = detail[detail["사업자"].astype(str) == business_name]
+    detail = detail.copy()
     detail = detail.drop(columns=["출처"], errors="ignore")
-    # 핫리로드 stale 모듈 대비: 원가 컬럼 없으면 수량×단가로 즉시 생성
-    if "거래금액(원가)" not in detail.columns and {"수량", "단가"}.issubset(detail.columns):
-        detail["거래금액(원가)"] = (
-            pd.to_numeric(detail["수량"], errors="coerce").fillna(0)
-            * pd.to_numeric(detail["단가"], errors="coerce").fillna(0)
-        )
     for col in (
         "수량",
         "외화단가",
@@ -594,7 +548,6 @@ def _filter_stock_trades(
         "외화수수료",
         "외화제세금",
         "환율",
-        "거래금액(원가)",
         "단가",
         "수수료",
         "제세금",
@@ -604,17 +557,12 @@ def _filter_stock_trades(
         if col in detail.columns:
             detail[col] = pd.to_numeric(detail[col], errors="coerce")
 
-    # 팝업: 시간순 정렬 (거래일자 → 거래일시 → ID)
     detail = _sort_trades_chronologically(detail)
     return detail.reset_index(drop=True)
 
 
 def _sort_trades_chronologically(df: pd.DataFrame) -> pd.DataFrame:
-    """거래일자·거래일시(있으면)·매수우선·ID 기준 오름차순.
-
-    DB에 거래일시가 없어도, 시간순으로 넣은 거래는 ID 순서가 시간순에 대응한다.
-    동일 일자에는 매수가 매도보다 먼저 오도록 한다.
-    """
+    """거래일자·거래일시(있으면)·ID 기준. 원본 업로드 순서를 ID로 유지한다."""
     if df is None or df.empty:
         return df
     work = df.copy()
@@ -642,17 +590,6 @@ def _sort_trades_chronologically(df: pd.DataFrame) -> pd.DataFrame:
         sort_by.append("_sort_time")
         drop_tmp.append("_sort_time")
 
-    # 매수(0) → 매도(1)
-    side_col = "거래유형" if "거래유형" in work.columns else None
-    if side_col:
-        work["_sort_side"] = work[side_col].map(
-            lambda v: 0
-            if ("매수" in str(v) or "매입" in str(v) or "입고" in str(v))
-            else 1
-        )
-        sort_by.append("_sort_side")
-        drop_tmp.append("_sort_side")
-
     if "ID" in work.columns:
         sort_by.append("ID")
 
@@ -663,26 +600,43 @@ def _sort_trades_chronologically(df: pd.DataFrame) -> pd.DataFrame:
     return work.drop(columns=drop_tmp, errors="ignore")
 
 
-DETAIL_TRADE_COLUMNS = [
-    "거래일자",
-    "증권사",
-    "종목코드",
-    "종목명",
-    "거래유형",
-    "수량",
-    "외화단가",
-    "거래/정산금액",
-    "외화수수료",
-    "외화제세금",
-    "환율",
-    "통화",
-    "거래금액(원가)",
-    "단가",
-    "수수료",
-    "제세금",
-    "정산금액",
-    "메모",
-]
+def _col_has_nonzero(df: pd.DataFrame, col: str) -> bool:
+    if df is None or df.empty or col not in df.columns:
+        return False
+    return bool(pd.to_numeric(df[col], errors="coerce").fillna(0).ne(0).any())
+
+
+def _detail_source_columns(df: pd.DataFrame) -> list[str]:
+    """증권사 원본에 있는 칸만. 없는 제세금·정산금액을 만들어 넣지 않는다."""
+    base = ["거래일자", "증권사", "종목코드", "종목명", "거래유형", "수량"]
+    if df is None or df.empty:
+        return [c for c in base if c in (df.columns if df is not None else [])]
+
+    has_fx = _col_has_nonzero(df, "외화단가") or _col_has_nonzero(df, "거래/정산금액")
+    if not has_fx and "통화" in df.columns:
+        curr = df["통화"].astype(str).str.upper().str.strip()
+        has_fx = bool(
+            curr.isin(["USD", "EUR", "JPY", "HKD", "CNY", "GBP", "AUD"]).any()
+        )
+
+    if has_fx:
+        wanted = [
+            *base,
+            "외화단가",
+            "거래/정산금액",
+            "외화수수료",
+        ]
+        if _col_has_nonzero(df, "외화제세금"):
+            wanted.append("외화제세금")
+        wanted.extend(["환율", "통화"])
+        return [c for c in wanted if c in df.columns]
+
+    wanted = [*base, "단가", "수수료"]
+    if _col_has_nonzero(df, "제세금"):
+        wanted.append("제세금")
+    if "정산금액" in df.columns:
+        wanted.append("정산금액")
+    return [c for c in wanted if c in df.columns]
 
 
 def _normalize_trade_date(value) -> str | None:
@@ -723,6 +677,7 @@ def show_stock_detail_modal(
     st.markdown(f"**종목명:** {stock_name}")
     if business_name:
         st.caption(f"사업자: {business_name}")
+    st.caption("증권사 원본 칸입니다. 없는 제세금·정산금액을 만들어 넣지 않습니다.")
 
     if df_stock_trades is None or df_stock_trades.empty:
         st.info("해당 종목의 거래 내역이 없습니다.")
@@ -732,7 +687,7 @@ def show_stock_detail_modal(
         st.error("거래 ID가 없어 일자를 수정할 수 없습니다.")
         return
 
-    display_cols = [c for c in DETAIL_TRADE_COLUMNS if c in df_stock_trades.columns]
+    display_cols = _detail_source_columns(df_stock_trades)
     # 팝업 표시 직전 시간순 재정렬
     sorted_src = _sort_trades_chronologically(df_stock_trades)
     work = sorted_src.loc[:, [c for c in [*display_cols, "ID"] if c in sorted_src.columns]].copy()
@@ -1913,7 +1868,10 @@ def page_dashboard(
                 st.warning(w)
 
     st.subheader("보유 잔고")
-    st.caption("종목명을 클릭하면 상세 매매 내역이 열립니다. 같은 종목이어도 증권사가 다르면 행이 분리됩니다.")
+    st.caption(
+        "종목명을 클릭하면 원본 매매 내역이 열립니다. "
+        "같은 종목이어도 증권사가 다르면 행이 분리됩니다."
+    )
 
     pos_df = positions_to_dataframe(positions)
     if pos_df.empty:
@@ -2748,8 +2706,8 @@ def page_voucher(
         if voucher_lines:
             st.markdown("##### 적요 미리보기")
             st.caption(
-                "메리츠 앞 금액은 엑셀 거래/정산금액입니다. "
-                "20683.188처럼 수량×단가가 보이면 변환기에서 같은 엑셀을 다시 등록하세요."
+                "종목 줄은 수량×단가, 증권사 줄은 수량×단가±수수료·제세금으로 "
+                "적요만 변환합니다. 저장된 거래 수치는 바꾸지 않습니다."
             )
             st.dataframe(
                 pd.DataFrame(
@@ -2845,8 +2803,8 @@ def page_broker_overseas(storage: Storage) -> None:
     st.caption(
         "미래에셋 해외주식 거래내역서 PDF, KB 증권계좌거래내역 엑셀, "
         "메리츠 등 **컬럼형 해외주식 거래내역 엑셀**을 읽습니다. "
-        "메리츠 적요는 `USD {거래/정산금액} / {수량}주*{단가} * {환율}` 입니다. "
-        "이미 등록된 같은 거래는 삭제하지 않고 거래/정산금액만 전표에 다시 넣습니다."
+        "전표 적요는 저장값을 바꾸지 않고, 출력 시점에 "
+        "`USD {수량×단가±수수료} / {수량}주*{단가} * {환율}` 로 표시합니다."
     )
 
     businesses = storage.list_businesses()
@@ -2960,7 +2918,7 @@ def page_broker_overseas(storage: Storage) -> None:
     st.markdown("### 파싱 미리보기 (검수 및 수정)")
     st.caption(
         "적용환율이 0인 행(외화배당 등)은 **적용환율** 칸에 직접 입력하세요. "
-        "**거래/정산금액**은 엑셀 빨간칸 그대로이며, 적요 앞 금액이 됩니다."
+        "엑셀 **거래/정산금액**은 미리보기용입니다. 적요는 전표 출력 시점에만 변환하며, 이미 저장된 거래는 바꾸지 않습니다."
     )
     df = ensure_overseas_preview_columns(df)
     edited = st.data_editor(
@@ -3080,6 +3038,8 @@ def page_broker_overseas(storage: Storage) -> None:
                         qty = 1.0
                 if qty <= 0 or price_fx < 0:
                     raise ValueError("수량/단가를 확인하세요.")
+                if fx <= 0 and gross_fx <= 0 and fee_fx <= 0 and tax_fx <= 0:
+                    continue
 
                 stock = storage.get_or_create_stock(
                     ticker, name, business_id=bid, market=MARKET_OVERSEAS
@@ -3108,10 +3068,7 @@ def page_broker_overseas(storage: Storage) -> None:
                     ov_source = "broker:overseas-xlsx"
                 else:
                     ov_source = "broker:mirae-overseas"
-                memo = attach_fx_gross_memo(
-                    str(row.get("메모") or ov_source),
-                    gross_fx,
-                )
+                memo = str(row.get("메모") or ov_source)
                 from src.brokers.base import parse_trade_date
 
                 trade_date = parse_trade_date(row.get("거래일자"))
@@ -3145,7 +3102,7 @@ def page_broker_overseas(storage: Storage) -> None:
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"행 {int(idx) + 1}: {exc}")
 
-        saved_n, db_dup, file_dup, patched = save_trades_with_dedupe(
+        saved_n, db_dup, file_dup = save_trades_with_dedupe(
             storage,
             trades,
             market=MARKET_OVERSEAS,
@@ -3153,8 +3110,6 @@ def page_broker_overseas(storage: Storage) -> None:
         )
         zero_fx_n = sum(1 for t in trades if float(getattr(t, "fx_rate", 0) or 0) <= 0)
         msg = f"{saved_n}건 반영 완료 → {biz} / {ov_account.name}"
-        if patched:
-            msg += f" (거래/정산금액 {patched}건 전표용으로 갱신)"
         if db_dup or file_dup:
             msg += f" (DB중복 {db_dup}건, 파일중복 {file_dup}건 제외)"
         if zero_fx_n:
@@ -3373,7 +3328,7 @@ def page_broker(
             market=market,
             account_id=int(dom_account.id),
         )
-        saved_n, db_dup, file_dup, _patched = save_trades_with_dedupe(
+        saved_n, db_dup, file_dup = save_trades_with_dedupe(
             storage,
             trades,
             market=market,
@@ -3497,7 +3452,7 @@ def page_opening_lots(
             if not trades:
                 st.warning("수량과 종목이 있는 행이 없습니다.")
                 return
-            saved_n, db_dup, file_dup, _patched = save_trades_with_dedupe(
+            saved_n, db_dup, file_dup = save_trades_with_dedupe(
                 storage,
                 trades,
                 market=market,
@@ -3833,7 +3788,7 @@ def page_legacy_journal(
                 market=market,
                 account_id=int(legacy_account.id),
             )
-            saved_n, db_dup, file_dup, _patched = save_trades_with_dedupe(
+            saved_n, db_dup, file_dup = save_trades_with_dedupe(
                 storage,
                 trades,
                 market=market,

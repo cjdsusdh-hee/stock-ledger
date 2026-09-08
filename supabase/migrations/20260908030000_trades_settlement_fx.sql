@@ -1,3 +1,3 @@
--- 해외주식 적요 앞 금액: 엑셀 '거래/정산금액'을 그대로 저장
+-- 컬럼 추가만. 기존 거래 수치 UPDATE 금지. 재적용하지 말 것.
 alter table public.trades
   add column if not exists settlement_fx double precision not null default 0;

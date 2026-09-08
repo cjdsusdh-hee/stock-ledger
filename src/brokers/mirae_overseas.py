@@ -445,9 +445,10 @@ _OV_NUM_COLS = {
 
 
 def preview_settle_fx(row: Any, qty: float = 0.0, price_fx: float = 0.0) -> float:
-    """미리보기 행에서 엑셀 거래/정산금액을 읽는다. 없으면 수량×단가."""
+    """미리보기 행에서 엑셀 거래/정산금액을 읽는다. 없으면 0 (수량×단가로 채우지 않음)."""
     from src.voucher_export import parse_fx_gross_from_memo
 
+    del qty, price_fx
     for key in ("거래/정산금액", "외화총액"):
         try:
             val = float(row.get(key) or 0)
@@ -461,8 +462,6 @@ def preview_settle_fx(row: Any, qty: float = 0.0, price_fx: float = 0.0) -> floa
         from_memo = 0.0
     if from_memo > 0:
         return abs(from_memo)
-    if qty > 0 and price_fx > 0:
-        return abs(qty * price_fx)
     return 0.0
 
 
@@ -517,7 +516,6 @@ def apply_overseas_preview_fx(df):
     - 적용환율 > 0 → 외화×환율
     """
     import pandas as pd
-    from src.voucher_export import attach_fx_gross_memo
 
     out = ensure_overseas_preview_columns(df)
     for idx in out.index:
@@ -531,7 +529,8 @@ def apply_overseas_preview_fx(df):
         ccy = str(out.at[idx, "통화코드"] or "USD")
         broker = str(out.at[idx, "증권사"] or "").strip() if "증권사" in out.columns else ""
         gross_fx = preview_settle_fx(out.loc[idx], qty, price_fx)
-        out.at[idx, "거래/정산금액"] = float(gross_fx)
+        if float(out.at[idx, "거래/정산금액"] or 0) <= 0:
+            out.at[idx, "거래/정산금액"] = float(gross_fx)
 
         out.at[idx, "적용환율"] = fx
         price_krw = price_fx * fx if fx > 0 else 0.0
@@ -549,17 +548,14 @@ def apply_overseas_preview_fx(df):
             # 외화배당
             settle = qty * price_krw - tax_krw
         out.at[idx, "거래금액(원)"] = float(round(settle, 0))
-        out.at[idx, "메모"] = attach_fx_gross_memo(
-            build_overseas_preview_memo(
-                kind=kind,
-                ticker=ticker,
-                qty=qty,
-                price_fx=price_fx,
-                fx_rate=fx,
-                currency=ccy,
-                broker=broker,
-            ),
-            gross_fx,
+        out.at[idx, "메모"] = build_overseas_preview_memo(
+            kind=kind,
+            ticker=ticker,
+            qty=qty,
+            price_fx=price_fx,
+            fx_rate=fx,
+            currency=ccy,
+            broker=broker,
         )
     return out
 

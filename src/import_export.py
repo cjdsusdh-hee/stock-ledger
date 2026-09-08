@@ -122,7 +122,6 @@ def dataframe_to_trades(
 ) -> tuple[list[Trade], list[str]]:
     """표준/유사 컬럼 DataFrame을 Trade 리스트로 변환하고 종목/사업자를 자동 생성."""
     from .models import normalize_market
-    from .voucher_export import attach_fx_gross_memo
 
     mkt = normalize_market(market)
     work = _normalize_columns(df.copy())
@@ -199,15 +198,12 @@ def dataframe_to_trades(
                 if "외화제세금" in work.columns
                 else 0.0
             )
-            settlement_fx = (
-                _to_float(row.get("외화총액", 0))
-                if "외화총액" in work.columns
-                else 0.0
-            )
-            if settlement_fx <= 0 and price_fx > 0 and qty > 0 and fx_rate > 0:
-                settlement_fx = abs(qty * price_fx)
-            if settlement_fx > 0:
-                memo = attach_fx_gross_memo(memo, settlement_fx)
+            settlement_fx = 0.0
+            for settle_col in ("거래/정산금액", "외화총액"):
+                if settle_col in work.columns:
+                    settlement_fx = _to_float(row.get(settle_col, 0))
+                    if settlement_fx > 0:
+                        break
             currency = "KRW"
             if "통화" in work.columns:
                 currency = normalize_currency(str(row.get("통화") or "KRW"))
@@ -286,8 +282,7 @@ def import_standard_file(
     account_id: int | None = None,
     skip_duplicates: bool = True,
 ) -> tuple[int, list[str]]:
-    from .dedupe import classify_trades, match_existing_trades
-    from .voucher_export import attach_fx_gross_memo
+    from .dedupe import classify_trades
 
     df = read_tabular(file_bytes, filename)
     trades, errors = dataframe_to_trades(
@@ -305,27 +300,10 @@ def import_standard_file(
             account_id=account_id,
         )
         classified = classify_trades(trades, existing)
-        patched = 0
-        for incoming, old in match_existing_trades(classified.db_duplicates, existing):
-            amt = float(getattr(incoming, "settlement_fx", 0) or 0)
-            if amt <= 0 or old.id is None:
-                continue
-            old_amt = float(getattr(old, "settlement_fx", 0) or 0)
-            old_memo = str(old.memo or "")
-            if abs(old_amt - amt) < 1e-6 and "외화총액=" in old_memo:
-                continue
-            storage.update_trade_settlement_fx(
-                int(old.id),
-                settlement_fx=amt,
-                memo=attach_fx_gross_memo(old_memo or incoming.memo or "", amt),
-                source=incoming.source or old.source,
-            )
-            patched += 1
         skipped = classified.db_dup_count + classified.file_dup_count
         trades = classified.fresh
         if skipped:
-            extra = f", 거래/정산금액 {patched}건 갱신" if patched else ""
-            errors.append(f"중복 {skipped}건은 제외했습니다{extra}.")
+            errors.append(f"중복 {skipped}건은 제외했습니다.")
     if trades:
         storage.add_trades_bulk(trades)
     return len(trades), errors

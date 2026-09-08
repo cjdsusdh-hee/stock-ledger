@@ -1,4 +1,4 @@
--- settlement_fx 추가 후 뷰가 t.*를 옛 컬럼으로 고정해 있어 다시 만든다.
+-- 뷰 재정의만. 거래 수치 UPDATE 금지. 재적용하지 말 것.
 drop view if exists public.trades_enriched;
 
 create view public.trades_enriched
