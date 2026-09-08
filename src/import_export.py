@@ -305,9 +305,6 @@ def import_standard_file(
             account_id=account_id,
         )
         classified = classify_trades(trades, existing)
-        from .dedupe import match_existing_trades
-        from .voucher_export import attach_fx_gross_memo
-
         patched = 0
         for incoming, old in match_existing_trades(classified.db_duplicates, existing):
             amt = float(getattr(incoming, "settlement_fx", 0) or 0)
