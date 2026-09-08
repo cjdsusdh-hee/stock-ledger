@@ -159,13 +159,21 @@ def parse_fx_gross_from_memo(memo: str) -> float:
         return 0.0
 
 
+def _stored_fx_gross(trade: Trade) -> float:
+    """저장된 거래/정산금액. DB를 바꾸지 않고 적요 출력에만 읽는다."""
+    stored = float(getattr(trade, "settlement_fx", 0) or 0)
+    if stored > 0:
+        return abs(stored)
+    return parse_fx_gross_from_memo(getattr(trade, "memo", "") or "")
+
+
 def _fx_gross_amount(trade: Trade) -> float:
-    """적요 앞 금액. DB를 바꾸지 않고 수량·단가·수수료로만 매핑한다."""
+    """엑셀 '거래/정산금액'을 그대로 쓴다. 없을 때만 수량×단가."""
+    stored = _stored_fx_gross(trade)
+    if stored > 0:
+        return stored
     qty, price_fx, _fx, _ccy = _trade_fx_parts(trade)
-    qty_amt = abs(qty * price_fx)
-    if qty_amt <= 0:
-        return 0.0
-    return qty_amt
+    return abs(qty * price_fx)
 
 
 def _is_overseas_trade(trade: Trade) -> bool:
@@ -299,10 +307,15 @@ def build_overseas_remark_amount(
 
     if price_fx > 0 and qty > 0:
         qty_amt = abs(qty * price_fx)
+        stored = _stored_fx_gross(trade)
         mode = (front or "").strip().lower()
         if mode == "qty":
             fx_amt = qty_amt
-        elif mode == "excel" or use_settlement_fx:
+        elif mode == "excel":
+            fx_amt = stored if stored > 0 else qty_amt
+        elif stored > 0:
+            fx_amt = stored
+        elif use_settlement_fx:
             fx_amt = _overseas_settle_fx(trade)
         else:
             fx_amt = qty_amt
@@ -383,7 +396,7 @@ def _fee_summary(trade: Trade, remark_mode: str, *, kind: str = "fee") -> str:
 
 
 def _deposit_summary(trade: Trade, remark_mode: str, base_memo: str) -> str:
-    """증권사(기타제예금) 적요. 출력 시점에만 수량·단가·수수료로 매핑한다."""
+    """증권사(기타제예금) 적요. 저장된 거래/정산금액을 출력 시점에만 읽는다."""
     if _is_overseas_trade(trade) and _use_amount_remark(trade, remark_mode):
         return build_overseas_remark_amount(trade, front="excel")
     if (
