@@ -30,27 +30,114 @@ def _fx_or_zero(value: object) -> float:
         return v if v > 0 else 0.0
 
 
-def _extract_text(file_bytes: bytes) -> str:
+_KINDS = (
+    "해외주식매수입고",
+    "해외주식매수출금",
+    "해외주식매도출고",
+    "해외주식매도입금",
+    "배당금외화입금",
+)
+_CASH_KINDS = {"해외주식매수출금", "해외주식매도입금", "배당금외화입금"}
+
+
+def _canon_date(raw: str) -> str:
+    parts = re.findall(r"\d+", str(raw or ""))
+    if len(parts) >= 3 and len(parts[0]) == 4:
+        y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+        if 1900 <= y <= 2099 and 1 <= m <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{m:02d}-{d:02d}"
+    digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    if len(digits) >= 8:
+        y, m, d = int(digits[:4]), int(digits[4:6]), int(digits[6:8])
+        if 1900 <= y <= 2099 and 1 <= m <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{m:02d}-{d:02d}"
+    return ""
+
+
+def _normalize_mirae_text(text: str) -> str:
+    """칸이 붙어 나와도 날짜·적요를 떨어뜨린다."""
+    out = (text or "").replace("\u00a0", " ").replace("\ufeff", "")
+    for kind in _KINDS:
+        out = out.replace(kind, f"\n{kind} ")
+    out = re.sub(r"(\d{4}[./-]\d{1,2}[./-]\d{1,2})(?!\d)", r"\1 ", out)
+    out = re.sub(r"[ \t]+", " ", out)
+    return out
+
+
+def _page_word_lines(page: Any) -> str:
+    try:
+        words = page.extract_words(use_text_flow=True) or []
+    except TypeError:
+        words = page.extract_words() or []
+    buckets: dict[int, list[tuple[float, str]]] = {}
+    for w in words:
+        y = int(round(float(w.get("top", 0))))
+        buckets.setdefault(y, []).append(
+            (float(w.get("x0", 0)), str(w.get("text") or ""))
+        )
+    lines: list[str] = []
+    for y in sorted(buckets):
+        parts = [t for _, t in sorted(buckets[y], key=lambda x: x[0]) if t]
+        if parts:
+            lines.append(" ".join(parts))
+    return "\n".join(lines)
+
+
+def _extract_text_candidates(file_bytes: bytes) -> list[str]:
     import pdfplumber
 
-    parts: list[str] = []
+    default_parts: list[str] = []
+    layout_parts: list[str] = []
+    word_parts: list[str] = []
+    table_parts: list[str] = []
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
-            t = page.extract_text() or ""
-            if t.strip():
-                parts.append(t)
-    return "\n".join(parts)
+            default_parts.append(page.extract_text() or "")
+            try:
+                layout_parts.append(page.extract_text(layout=True) or "")
+            except TypeError:
+                layout_parts.append("")
+            word_parts.append(_page_word_lines(page))
+            for table in page.extract_tables() or []:
+                for row in table or []:
+                    cells = [
+                        str(c).strip()
+                        for c in (row or [])
+                        if c is not None and str(c).strip()
+                    ]
+                    if cells:
+                        table_parts.append(" ".join(cells))
+    return [
+        "\n".join(default_parts),
+        "\n".join(layout_parts),
+        "\n".join(word_parts),
+        "\n".join(table_parts),
+    ]
+
+
+def _mirae_kind_score(text: str) -> int:
+    return sum((text or "").count(k) for k in _KINDS)
+
+
+def _extract_text(file_bytes: bytes) -> str:
+    scored: list[tuple[int, int, str]] = []
+    for idx, raw in enumerate(_extract_text_candidates(file_bytes)):
+        norm = _normalize_mirae_text(raw)
+        scored.append((_mirae_kind_score(norm), idx, norm))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return scored[0][2] if scored else ""
 
 
 _HEADER = re.compile(
-    r"(?P<date>\d{4}/\d{2}/\d{2})\s+"
+    r"(?:(?P<date>\d{4}[./-]\d{1,2}[./-]\d{1,2})(?!\d)\s+)?"
     r"(?P<kind>해외주식매수입고|해외주식매수출금|해외주식매도출고|해외주식매도입금|배당금외화입금)\s+"
-    r"(?P<ticker>\S+)"
+    r"(?P<ticker>[A-Za-z][A-Za-z0-9.\-]*)"
     r"(?:\s+(?P<n1>[\d,\.]+))?"
     r"(?:\s+(?P<n2>[\d,\.]+))?"
     r"(?:\s+(?P<n3>[\d,\.]+))?"
     r"(?:\s+(?P<n4>[\d,\.]+))?"
 )
+_DATE_ONLY = re.compile(r"^(?P<date>\d{4}[./-]\d{1,2}[./-]\d{1,2})(?!\d)\b")
 
 # 환율 컬럼만 인정: `1,313.70 수지WM 07:23:10` 또는 `… Direct`
 _FX_LINE = re.compile(
@@ -198,123 +285,7 @@ def parse_mirae_overseas_pdf(file_bytes: bytes, filename: str = "") -> dict[str,
     ):
         notes.append("미래에셋 해외주식 거래내역서 서식이 아닐 수 있습니다.")
 
-    lines = text.splitlines()
-    rows: list[dict[str, Any]] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        m = _HEADER.match(line)
-        if not m:
-            i += 1
-            continue
-
-        kind = m.group("kind")
-        if kind in {"해외주식매수출금", "해외주식매도입금", "배당금외화입금"}:
-            i += 1
-            continue
-
-        date = m.group("date").replace("/", "-")
-        ticker = m.group("ticker").strip()
-        n1 = _num(m.group("n1"))
-        n2 = _num(m.group("n2"))
-
-        block = [lines[j].strip() for j in range(i + 1, min(i + 8, len(lines)))]
-        qty = 0.0
-        price_fx = 0.0
-        fee_fx = 0.0
-        tax_fx = 0.0
-        currency = "USD"
-        name = ticker
-        side = "BUY"
-
-        if kind == "해외주식매수입고":
-            side = "BUY"
-            fee_fx = n1 if 0 < n1 < 100 else 0.0
-            for bl in block:
-                if re.match(r"^\d{4}/\d{2}/\d{2}\b", bl):
-                    break
-                dm = _parse_trade_detail(bl)
-                if dm:
-                    qty = float(dm["qty"])
-                    price_fx = float(dm["price"])
-                    name = str(dm["name"] or ticker)
-                    currency = str(dm["ccy"])
-                    tax_fx = float(dm["tax"] or 0)
-                    break
-            if qty <= 0 and n2 > 0 and price_fx > 0:
-                qty = n2 / price_fx
-
-        elif kind == "해외주식매도출고":
-            side = "SELL"
-            fee_fx = n1 if 0 < n1 < 100 else 0.0
-            for bl in block:
-                if re.match(r"^\d{4}/\d{2}/\d{2}\b", bl):
-                    break
-                dm = _parse_trade_detail(bl)
-                if dm:
-                    qty = float(dm["qty"])
-                    price_fx = float(dm["price"])
-                    name = str(dm["name"] or ticker)
-                    currency = str(dm["ccy"])
-                    break
-            if qty <= 0 and n2 > 0 and price_fx > 0:
-                qty = n2 / price_fx
-
-        elif kind == "배당금외화입금":
-            side = "DIVIDEND"
-            gross = n1
-            qty = 1.0
-            price_fx = gross
-            for bl in block:
-                if re.match(r"^\d{4}/\d{2}/\d{2}\b", bl):
-                    break
-                dm = _parse_div_detail(bl, gross)
-                if dm:
-                    if dm["name"]:
-                        name = str(dm["name"])
-                    currency = str(dm["ccy"])
-                    tax_fx = float(dm["tax"] or 0)
-                    net = float(dm["net"] or 0)
-                    if net > 0:
-                        price_fx = net
-                    if net > 0 and gross > net:
-                        tax_fx = max(tax_fx, gross - net) if tax_fx <= 0 else tax_fx
-                    break
-
-        # ★ 환율: PDF '환율' 컬럼 라인만 사용. 없으면 0 (단가·금액으로 추정 금지)
-        fx_rate = _find_fx_in_block(block)
-
-        if qty <= 0 or (side != "DIVIDEND" and price_fx <= 0 and n2 <= 0):
-            i += 1
-            continue
-
-        if price_fx <= 0 and n2 > 0 and qty > 0:
-            price_fx = n2 / qty
-
-        fx_rate = _fx_or_zero(fx_rate)
-
-        rows.append(
-            {
-                "거래일자": date,
-                "거래유형": (
-                    "해외매수"
-                    if side == "BUY"
-                    else ("해외매도" if side == "SELL" else "외화배당")
-                ),
-                "side": side,
-                "종목코드": ticker,
-                "종목명": name,
-                "수량": qty,
-                "외화단가": price_fx,
-                "외화수수료": fee_fx,
-                "외화제세금": tax_fx,
-                "통화코드": currency,
-                "적용환율": fx_rate,
-                "메모": f"미래에셋 {kind}",
-            }
-        )
-        i += 1
-
+    rows = _parse_mirae_lines(text.splitlines())
     zero_fx = sum(1 for r in rows if float(r.get("적용환율") or 0) <= 0)
     notes.append(
         f"미래에셋 해외주식 PDF에서 {len(rows)}건을 추출했습니다."
@@ -328,6 +299,115 @@ def parse_mirae_overseas_pdf(file_bytes: bytes, filename: str = "") -> dict[str,
             "미리보기에서 적용환율을 직접 입력하면 원화·메모가 재계산됩니다."
         )
     return {"rows": rows, "notes": notes, "source": "mirae-overseas-pdf"}
+
+
+def _parse_mirae_lines(lines: list[str]) -> list[dict[str, Any]]:
+    """날짜와 적요가 다른 줄이어도 매수·매도출고를 잡는다."""
+    rows: list[dict[str, Any]] = []
+    last_date = ""
+    i = 0
+    while i < len(lines):
+        line = (lines[i] or "").strip()
+        dm = _DATE_ONLY.match(line)
+        if dm:
+            parsed = _canon_date(dm.group("date"))
+            if parsed:
+                last_date = parsed
+        m = _HEADER.search(line)
+        if not m:
+            i += 1
+            continue
+
+        kind = m.group("kind")
+        if kind in _CASH_KINDS:
+            i += 1
+            continue
+
+        date = _canon_date(m.group("date") or last_date)
+        if not date:
+            i += 1
+            continue
+        last_date = date
+        ticker = (m.group("ticker") or "").strip()
+        n1 = _num(m.group("n1"))
+        n2 = _num(m.group("n2"))
+
+        block = [str(lines[j] or "").strip() for j in range(i + 1, min(i + 14, len(lines)))]
+        qty = 0.0
+        price_fx = 0.0
+        fee_fx = 0.0
+        tax_fx = 0.0
+        currency = "USD"
+        name = ticker
+        side = "BUY"
+
+        if kind == "해외주식매수입고":
+            side = "BUY"
+            fee_fx = n1 if 0 < n1 < 100 else 0.0
+            for bl in block:
+                if _DATE_ONLY.match(bl) or _HEADER.search(bl):
+                    break
+                detail = _parse_trade_detail(bl)
+                if detail:
+                    qty = float(detail["qty"])
+                    price_fx = float(detail["price"])
+                    name = str(detail["name"] or ticker)
+                    currency = str(detail["ccy"])
+                    tax_fx = float(detail["tax"] or 0)
+                    break
+            if qty <= 0 and n2 > 0 and price_fx > 0:
+                qty = n2 / price_fx
+
+        elif kind == "해외주식매도출고":
+            side = "SELL"
+            fee_fx = n1 if 0 < n1 < 100 else 0.0
+            for bl in block:
+                if _DATE_ONLY.match(bl) or _HEADER.search(bl):
+                    break
+                detail = _parse_trade_detail(bl)
+                if detail:
+                    qty = float(detail["qty"])
+                    price_fx = float(detail["price"])
+                    name = str(detail["name"] or ticker)
+                    currency = str(detail["ccy"])
+                    break
+            if qty <= 0 and n2 > 0 and price_fx > 0:
+                qty = n2 / price_fx
+
+        else:
+            i += 1
+            continue
+
+        fx_rate = _find_fx_in_block(block)
+
+        if qty <= 0 or (price_fx <= 0 and n2 <= 0):
+            i += 1
+            continue
+
+        if price_fx <= 0 and n2 > 0 and qty > 0:
+            price_fx = n2 / qty
+
+        settle_fx = n2 if n2 > 0 else (qty * price_fx if qty > 0 and price_fx > 0 else 0.0)
+
+        rows.append(
+            {
+                "거래일자": date,
+                "거래유형": "해외매수" if side == "BUY" else "해외매도",
+                "side": side,
+                "종목코드": ticker,
+                "종목명": name,
+                "수량": qty,
+                "외화단가": price_fx,
+                "거래/정산금액": settle_fx,
+                "외화수수료": fee_fx,
+                "외화제세금": tax_fx,
+                "통화코드": currency,
+                "적용환율": _fx_or_zero(fx_rate),
+                "메모": f"미래에셋 {kind}",
+            }
+        )
+        i += 1
+    return rows
 
 
 _OV_PREVIEW_COLS = [

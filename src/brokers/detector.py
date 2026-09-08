@@ -57,6 +57,37 @@ def detect_and_parse(
 
     # ---- PDF ----
     if ext == "pdf" or is_pdf_file(file_bytes, filename):
+        from .mirae_overseas import parse_mirae_overseas_pdf
+
+        mirae = parse_mirae_overseas_pdf(file_bytes, filename)
+        if mirae.get("rows"):
+            from .base import to_standard_frame
+
+            rows = []
+            for r in mirae["rows"]:
+                side = str(r.get("side") or "")
+                label = "매수" if side == "BUY" else ("매도" if side == "SELL" else "배당")
+                rows.append(
+                    {
+                        "거래일자": r.get("거래일자"),
+                        "사업자": default_business,
+                        "종목코드": r.get("종목코드"),
+                        "종목명": r.get("종목명"),
+                        "거래유형": label,
+                        "수량": r.get("수량"),
+                        "단가": r.get("외화단가"),
+                        "수수료": r.get("외화수수료"),
+                        "제세금": r.get("외화제세금"),
+                        "정산금액": r.get("거래/정산금액"),
+                        "메모": r.get("메모"),
+                    }
+                )
+            return BrokerParseResult(
+                broker_name="미래에셋증권",
+                dataframe=to_standard_frame(rows),
+                notes=list(mirae.get("notes") or []),
+                confidence=0.9,
+            )
         return parse_broker_pdf(
             file_bytes,
             filename,

@@ -2895,7 +2895,7 @@ def page_broker_overseas(storage: Storage) -> None:
     show_uploaded_file(up_name, up_size)
 
     if up_bytes and up_name:
-        token = f"{up_name}:{up_size}:{biz}:datefix1"
+        token = f"{up_name}:{up_size}:{biz}:mirae_pdf_v2"
         if st.session_state.get("ov_broker_token") != token:
             ext = up_name.rsplit(".", 1)[-1].lower() if "." in up_name else ""
             try:
@@ -2910,10 +2910,16 @@ def page_broker_overseas(storage: Storage) -> None:
                             result = parse_generic_overseas_excel(up_bytes, up_name)
                     if not (result.get("rows") or []):
                         notes = [n for n in (result.get("notes") or []) if n]
-                        notes.append(
-                            f"이 파일({up_name})에서 해외주식 거래를 찾지 못했습니다. "
-                            "거래일자·매매구분·수량·단가 컬럼이 있는 엑셀인지 확인하세요."
-                        )
+                        if ext == "pdf" or up_bytes[:4] == b"%PDF":
+                            notes.append(
+                                f"이 PDF({up_name})에서 해외주식 매수·매도를 찾지 못했습니다. "
+                                "미래에셋 '해외주식 거래내역서'인지 확인하세요."
+                            )
+                        else:
+                            notes.append(
+                                f"이 파일({up_name})에서 해외주식 거래를 찾지 못했습니다. "
+                                "거래일자·매매구분·수량·단가 컬럼이 있는 엑셀인지 확인하세요."
+                            )
                         result["rows"] = []
                         result["notes"] = list(dict.fromkeys(notes))
                         result["source"] = result.get("source") or "overseas-unknown"
