@@ -2467,7 +2467,7 @@ _VOUCHER_MEMO_OPTIONS: dict[str, str] = {
 
 def _resolve_voucher_memo_mode(market: str, label: object | None = None) -> str:
     """라디오·session_state에서 적요 모드(stock|amount) 확정."""
-    key = f"ie_memo_fmt_v4_{normalize_market(market)}"
+    key = f"ie_memo_fmt_v5_{normalize_market(market)}"
     raw = label if label is not None else st.session_state.get(key)
     if raw in _VOUCHER_MEMO_OPTIONS:
         return _VOUCHER_MEMO_OPTIONS[raw]
@@ -2530,30 +2530,34 @@ def page_voucher(
     )
 
     st.markdown("##### 적요 형식")
-    radio_key = f"ie_memo_fmt_v4_{market}"
+    radio_key = f"ie_memo_fmt_v5_{market}"
     memo_labels = list(_VOUCHER_MEMO_OPTIONS.keys())
     memo_mode_label = st.radio(
         "적요 형식",
         options=memo_labels,
-        index=0,
+        index=1 if normalize_market(market) == MARKET_OVERSEAS else 0,
         horizontal=False,
         key=radio_key,
         label_visibility="collapsed",
         help=(
             "회계 전표 엑셀의 적요에 적용됩니다. "
-            "메리츠 해외주식은 옵션과 관계없이 엑셀 거래/정산금액을 앞 금액으로 씁니다."
+            "해외주식 기본: 종목 줄은 수량×단가, 증권사 줄은 엑셀 거래/정산금액."
         ),
     )
     remark_mode = _resolve_voucher_memo_mode(market, memo_mode_label)
     if normalize_market(market) == MARKET_OVERSEAS:
         st.caption(
-            "메리츠: `USD {거래/정산금액} / {수량}주*{단가} * {환율}` "
-            "(앞 금액은 엑셀 칸 그대로, 수량×단가 재계산 없음)"
+            "기본 규칙 — 종목: `USD {수량×단가} / {수량}주*{단가} * {환율}` · "
+            "증권사(기타제예금): `USD {거래/정산금액} / {수량}주*{단가} * {환율}` · "
+            "수수료: `USD {수수료} * {환율}`"
         )
     if remark_mode == "stock":
-        st.caption("예: INVESCO NASDAQ 100 매수 / @40주 * $247.67 * 1442.00원")
+        st.caption("국내 예: INVESCO NASDAQ 100 매수 / @40주 * $247.67 * 1442.00원")
     else:
-        st.caption("예: USD 20862.39 / 180주*115.9095 * 1441.1  (앞부분은 거래/정산금액)")
+        st.caption(
+            "예: 종목 `USD 22922 / 200주*114.61 * 1433.6` · "
+            "증권사 `USD 22979.3 / 200주*114.61 * 1433.6`"
+        )
 
     today = date.today()
     # 구버전 range 키 → 분리 키 마이그레이션

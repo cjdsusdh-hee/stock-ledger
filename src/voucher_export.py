@@ -222,10 +222,10 @@ def _is_meritz_trade(trade: Trade) -> bool:
 
 
 def _use_amount_remark(trade: Trade, remark_mode: str) -> bool:
-    """옵션2이거나 메리츠면 거래/정산금액을 앞 금액으로 쓰는 적요."""
-    if (remark_mode or "").strip().lower() == "amount":
+    """해외주식 기본 적요: 종목=수량×단가, 증권사=거래/정산금액."""
+    if _is_overseas_trade(trade):
         return True
-    return _is_overseas_trade(trade) and _is_meritz_trade(trade)
+    return (remark_mode or "").strip().lower() == "amount"
 
 
 def _is_kb_trade(trade: Trade) -> bool:
