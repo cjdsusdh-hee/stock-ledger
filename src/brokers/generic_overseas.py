@@ -7,7 +7,7 @@ from typing import Any
 
 import pandas as pd
 
-from src.brokers.base import clean_number, find_col
+from src.brokers.base import clean_number, find_col, parse_trade_date
 from src.models import coerce_fx_rate, normalize_currency, normalize_side
 
 
@@ -16,7 +16,16 @@ CODE_CANDS = ["종목코드", "단축코드", "종목번호", "티커", "Ticker"
 NAME_CANDS = ["종목명", "종목", "종목이름", "한글종목명"]
 SIDE_CANDS = ["거래유형", "매매구분", "주문구분", "거래구분", "구분", "매수매도"]
 QTY_CANDS = ["체결수량", "거래수량", "수량", "주문수량"]
-PRICE_FX_CANDS = ["외화단가", "외화가격", "체결단가", "체결가", "단가", "가격"]
+PRICE_FX_CANDS = [
+    "거래단가(외화)",
+    "거래단가",
+    "외화단가",
+    "외화가격",
+    "체결단가",
+    "체결가",
+    "단가",
+    "가격",
+]
 FEE_FX_CANDS = ["외화수수료", "수수료", "제비용"]
 TAX_FX_CANDS = ["외화제세금", "제세금", "세금", "거래세"]
 FX_CANDS = ["적용환율", "적용 환율", "환율", "매매환율"]
@@ -104,6 +113,10 @@ def parse_generic_overseas_excel(
             if pd.isna(raw_side) or str(raw_side).strip() in {"", "-", "nan"}:
                 skipped += 1
                 continue
+            side_text = str(raw_side)
+            if any(tok in side_text for tok in ("환전", "입금", "출금", "이체")):
+                skipped += 1
+                continue
             side = normalize_side(raw_side)
             if side == "DIVIDEND":
                 skipped += 1
@@ -113,9 +126,8 @@ def parse_generic_overseas_excel(
             if qty <= 0 or price <= 0:
                 skipped += 1
                 continue
-            date_raw = row[date_c] if date_c else ""
-            trade_date = pd.to_datetime(date_raw, errors="coerce")
-            if pd.isna(trade_date):
+            date_s = parse_trade_date(row[date_c] if date_c else "")
+            if not date_s:
                 skipped += 1
                 continue
             code = "" if code_c is None else str(row[code_c] or "").strip()
@@ -129,7 +141,7 @@ def parse_generic_overseas_excel(
             kind = "해외매수" if side == "BUY" else "해외매도"
             rows.append(
                 {
-                    "거래일자": trade_date.strftime("%Y-%m-%d"),
+                    "거래일자": date_s,
                     "거래유형": kind,
                     "종목코드": code or name,
                     "종목명": name or code,

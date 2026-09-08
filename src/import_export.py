@@ -62,10 +62,12 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _parse_date(value: Any) -> str:
-    ts = pd.to_datetime(value, errors="coerce")
-    if pd.isna(ts):
+    from .brokers.base import parse_trade_date
+
+    parsed = parse_trade_date(value)
+    if not parsed:
         raise ValueError(f"날짜 파싱 실패: {value}")
-    return ts.strftime("%Y-%m-%d")
+    return parsed
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
