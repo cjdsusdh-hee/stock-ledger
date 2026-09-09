@@ -53,6 +53,7 @@ _import_export_mod = importlib.reload(_import_export_mod)
 AccountConfig = _models_mod.AccountConfig
 IncomeAccountConfig = _models_mod.IncomeAccountConfig
 Trade = _models_mod.Trade
+Lot = _models_mod.Lot
 MARKET_DOMESTIC = _models_mod.MARKET_DOMESTIC
 MARKET_OVERSEAS = _models_mod.MARKET_OVERSEAS
 FX_CURRENCIES = _models_mod.FX_CURRENCIES
@@ -742,6 +743,51 @@ def _running_qty_by_trade_id(trades: list) -> dict[int, float]:
     return remaining
 
 
+def _running_cost_by_trade_id(trades: list) -> dict[int, float]:
+    """시간순 FIFO 처리 후 각 거래 시점의 원가잔액(잔여수량 × 매수단가)."""
+    cost_by_id: dict[int, float] = {}
+    lots: list[Lot] = []
+    for trade in sorted(
+        trades or [],
+        key=lambda t: (str(t.trade_date or ""), int(t.id or 0)),
+    ):
+        tid = int(trade.id) if trade.id is not None else None
+        if trade.side == "DIVIDEND":
+            if tid is not None:
+                cost_by_id[tid] = sum(lot.cost_basis for lot in lots)
+            continue
+        if trade.side == "BUY":
+            lots.append(
+                Lot(
+                    trade_id=trade.id or 0,
+                    trade_date=trade.trade_date,
+                    business_id=trade.business_id,
+                    stock_id=trade.stock_id,
+                    original_qty=trade.quantity,
+                    remaining_qty=trade.quantity,
+                    price=trade.price,
+                    fee=trade.fee,
+                    stock_code=trade.stock_code,
+                    stock_name=trade.stock_name,
+                    business_name=trade.business_name,
+                    account_id=getattr(trade, "account_id", None),
+                    account_name=getattr(trade, "account_name", "") or "",
+                )
+            )
+        elif trade.side == "SELL":
+            remaining_to_sell = float(trade.quantity or 0)
+            while remaining_to_sell > 1e-12 and lots:
+                lot = lots[0]
+                matched = min(lot.remaining_qty, remaining_to_sell)
+                lot.remaining_qty -= matched
+                remaining_to_sell -= matched
+                if lot.remaining_qty <= 1e-12:
+                    lots.pop(0)
+        if tid is not None:
+            cost_by_id[tid] = sum(lot.cost_basis for lot in lots)
+    return cost_by_id
+
+
 def _build_stock_verify_df(
     trades: list,
     positions: list,
@@ -749,9 +795,9 @@ def _build_stock_verify_df(
     history: list | None = None,
 ) -> pd.DataFrame:
     """클릭 종목의 확인용 상세: 누적 잔여수량·매수단가·거래금액."""
-    remaining = _running_qty_by_trade_id(
-        history if history is not None else trades
-    )
+    hist = history if history is not None else trades
+    remaining = _running_qty_by_trade_id(hist)
+    cost_basis = _running_cost_by_trade_id(hist)
 
     has_fx = any(
         float(getattr(t, "price_fx", 0) or 0) != 0
@@ -776,14 +822,15 @@ def _build_stock_verify_df(
         fx_amount = settle_fx if settle_fx > 1e-12 else (qty * price_fx if price_fx else pd.NA)
         tid = int(trade.id) if trade.id is not None else None
         rem = remaining.get(tid) if tid is not None else pd.NA
+        cost = cost_basis.get(tid) if tid is not None else pd.NA
         row = {
-            "ID": tid,
             "거래일자": _normalize_trade_date(trade.trade_date) or str(trade.trade_date or ""),
             "증권사": getattr(trade, "account_name", "") or "",
             "종목명": getattr(trade, "stock_name", "") or "",
             "거래유형": side,
             "수량": qty,
             "잔여수량": rem,
+            "원가잔액": round(cost) if cost is not pd.NA else pd.NA,
             "매수단가(원화)": round(price) if trade.side == "BUY" else pd.NA,
             "거래금액(원화)": round(qty * price),
             "단가": round(price),
@@ -799,11 +846,11 @@ def _build_stock_verify_df(
     if df.empty:
         return df
     order = [
-        "ID",
         "거래일자",
         "거래유형",
         "수량",
         "잔여수량",
+        "원가잔액",
         "매수단가(외화)",
         "매수단가(원화)",
         "거래금액(외화)",
@@ -819,7 +866,6 @@ def _build_stock_verify_df(
 
 def _verify_table_column_config() -> dict:
     return {
-        "ID": st.column_config.NumberColumn("ID", format="%d", width="small"),
         "거래일자": st.column_config.TextColumn("거래일자", width="small"),
         "증권사": st.column_config.TextColumn("증권사", width="medium"),
         "종목명": st.column_config.TextColumn("종목명", width="medium"),
@@ -829,6 +875,11 @@ def _verify_table_column_config() -> dict:
             "잔여수량",
             format="%.4f",
             help="시간순 매수(+) / 매도(-) 누적. 그 행까지 보유 수량",
+        ),
+        "원가잔액": st.column_config.NumberColumn(
+            "원가잔액",
+            format="%,d 원",
+            help="그 거래 반영 후 FIFO 원가잔액(잔여수량 × 매수단가, 수수료 미포함)",
         ),
         "매수단가(외화)": st.column_config.NumberColumn("매수단가(외화)", format="%.4f"),
         "매수단가(원화)": st.column_config.NumberColumn("매수단가(원화)", format="%,d 원"),
@@ -920,7 +971,7 @@ def show_stock_detail_modal(
         f"(최근 거래 원화단가) · 누적실현손익 {money(realized)} 원"
     )
     st.caption(
-        "잔여수량은 매수(+) / 매도(-) 누적입니다. "
+        "잔여수량은 매수(+) / 매도(-) 누적, 원가잔액은 FIFO(잔여수량 × 매수단가)입니다. "
         "매수단가는 매수 행의 체결단가이며 매도 행은 비웁니다."
     )
 
@@ -932,11 +983,11 @@ def show_stock_detail_modal(
         display_cols = [
             c
             for c in (
-                "ID",
                 "거래일자",
                 "거래유형",
                 "수량",
                 "잔여수량",
+                "원가잔액",
                 "매수단가(외화)",
                 "매수단가(원화)",
                 "거래금액(외화)",
