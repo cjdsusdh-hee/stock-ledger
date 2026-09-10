@@ -65,6 +65,7 @@ compute_positions = _fifo_mod.compute_positions
 Storage = _storage_mod.Storage
 export_voucher_excel_bytes = _voucher_mod.export_voucher_excel_bytes
 trades_to_voucher_lines = _voucher_mod.trades_to_voucher_lines
+summarize_period_sell_fifo = _voucher_mod.summarize_period_sell_fifo
 parse_income_file = _income_parser_mod.parse_income_file
 rows_to_dataframe = _income_parser_mod.rows_to_dataframe
 apply_income_fx_rates = _income_parser_mod.apply_income_fx_rates
@@ -3034,11 +3035,37 @@ def page_voucher(
         else []
     )
     line_count = len(voucher_lines)
+    fifo_total, fifo_rows = summarize_period_sell_fifo(period_trades, all_sells)
+    fifo_warn = [r for r in fifo_rows if str(r.get("매칭", "")).startswith("⚠")]
 
     st.info(
         f"선택된 기간: **{start_date.isoformat()} ~ {end_date.isoformat()}** "
         f"(총 {len(period_trades)}건의 거래, {line_count}줄의 분개 생성)"
     )
+    if fifo_rows:
+        st.caption(
+            f"기간 매도 **{len(fifo_rows)}건** · FIFO 원가 합계(전표 **투자유가증권 대변**): "
+            f"**{money(fifo_total)}**원"
+        )
+        if fifo_warn:
+            st.warning(
+                f"FIFO 매칭 없음 {len(fifo_warn)}건 — 전표 원가가 0원으로 나갈 수 있습니다. "
+                "매도 이전 매수·기초잔고 이력을 확인하세요."
+            )
+        with st.expander("FIFO 매칭 확인 (매도 원가)"):
+            st.caption(
+                "같은 날 매도가 여러 건이면 건별로 나뉩니다. "
+                "전표의 「주식매도 원가 @수량 * 단가」 줄 합계와 FIFO원가가 같아야 합니다."
+            )
+            st.dataframe(
+                pd.DataFrame(fifo_rows),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "FIFO원가": st.column_config.NumberColumn("FIFO원가", format="%,d 원"),
+                    "매도수량": st.column_config.NumberColumn("매도수량", format="%.0f"),
+                },
+            )
 
     if not period_trades:
         st.info("💡 선택한 기간에 해당하는 거래 내역이 없습니다.")

@@ -718,6 +718,59 @@ def _sell_lines(
     return lines
 
 
+def sell_fifo_book_won(sell: SellResult | None) -> int:
+    """매도 1건의 FIFO 원가(전표 투자유가증권 대변 합계)."""
+    if not sell or not sell.matches:
+        return 0
+    return sum(_won(m.matched_qty * m.buy_price) for m in sell.matches)
+
+
+def summarize_period_sell_fifo(
+    period_trades: Iterable[Trade],
+    sells: Iterable[SellResult],
+) -> tuple[int, list[dict[str, str | int | float]]]:
+    """기간 매도 FIFO 원가 합계와 매칭 내역(전표 검증용)."""
+    sell_by_id: dict[int, SellResult] = {}
+    for s in sells:
+        if s.trade_id is None:
+            continue
+        try:
+            sell_by_id[int(s.trade_id)] = s
+        except (TypeError, ValueError):
+            continue
+
+    rows: list[dict[str, str | int | float]] = []
+    total = 0
+    for trade in sorted(
+        (t for t in period_trades if t.side == "SELL"),
+        key=lambda t: (t.trade_date, t.id or 0),
+    ):
+        sell = None
+        if trade.id is not None:
+            try:
+                sell = sell_by_id.get(int(trade.id))
+            except (TypeError, ValueError):
+                sell = None
+        book = sell_fifo_book_won(sell)
+        total += book
+        match_parts: list[str] = []
+        if sell and sell.matches:
+            for m in sell.matches:
+                match_parts.append(
+                    f"{m.buy_date} {_won(m.matched_qty):,}주×{_won(m.buy_price):,}원"
+                )
+        rows.append(
+            {
+                "거래일자": str(trade.trade_date)[:10],
+                "종목": (trade.stock_name or trade.stock_code or "").strip(),
+                "매도수량": float(trade.quantity or 0),
+                "FIFO원가": book,
+                "매칭": " · ".join(match_parts) if match_parts else "⚠ 매칭 없음",
+            }
+        )
+    return total, rows
+
+
 def trades_to_voucher_lines(
     trades: Iterable[Trade],
     sells: Iterable[SellResult],
