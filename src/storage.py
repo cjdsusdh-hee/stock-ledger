@@ -21,7 +21,7 @@ from .models import (
     normalize_market,
     now_str,
 )
-from .supabase_client import get_supabase_client
+from .supabase_client import format_supabase_error, get_supabase_client
 
 DEFAULT_DB_PATH = None  # 호환용 (더 이상 SQLite 파일을 쓰지 않음)
 UNASSIGNED_ACCOUNT_NAME = "미지정"
@@ -76,7 +76,10 @@ class Storage:
                 q = extra(q)
             if order:
                 q = q.order(order, desc=desc)
-            res = q.range(start, start + _PAGE - 1).execute()
+            try:
+                res = q.range(start, start + _PAGE - 1).execute()
+            except Exception as exc:  # noqa: BLE001
+                raise format_supabase_error(exc) from exc
             chunk = list(res.data or [])
             rows.extend(chunk)
             if len(chunk) < _PAGE:
@@ -98,7 +101,10 @@ class Storage:
                     q = q.eq(key, value)
         if extra is not None:
             q = extra(q)
-        res = q.limit(1).execute()
+        try:
+            res = q.limit(1).execute()
+        except Exception as exc:  # noqa: BLE001
+            raise format_supabase_error(exc) from exc
         data = res.data or []
         return data[0] if data else None
 

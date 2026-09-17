@@ -5180,10 +5180,31 @@ def page_income(storage: Storage, business_id: int | None) -> None:
         )
 
 
+def render_supabase_setup_help(exc: BaseException) -> None:
+    """Supabase 연결/설정 오류를 Streamlit Cloud에서 바로 조치할 수 있게 안내한다."""
+    st.error("Supabase에 연결할 수 없어 앱을 시작하지 못했습니다.")
+    st.code(str(exc), language=None)
+    st.markdown(
+        "**Streamlit Cloud 설정 예시** (Manage app → Secrets):\n\n"
+        "```toml\n"
+        "[supabase]\n"
+        'url = "https://YOUR_PROJECT_REF.supabase.co"\n'
+        'key = "YOUR_ANON_PUBLIC_KEY"\n'
+        "```\n\n"
+        "- `url`: Supabase → Project Settings → **API** → **Project URL**\n"
+        "- `key`: 같은 화면의 **anon public** key\n"
+        "- 프로젝트가 **Paused** 이면 Dashboard에서 **Restore project** 후 다시 시도"
+    )
+    st.stop()
+
+
 def main() -> None:
     init_session_state()
     inject_sidebar_styles()
-    storage = get_storage()
+    try:
+        storage = get_storage()
+    except RuntimeError as exc:
+        render_supabase_setup_help(exc)
 
     pending_toast = st.session_state.pop("_pending_toast", None)
     if pending_toast:
@@ -5192,7 +5213,10 @@ def main() -> None:
         show_ingest_done_dialog()
 
     # 사이드바: 사업자 → 시장 → 작업 순서
-    business_id = sidebar_business_selector(storage)
+    try:
+        business_id = sidebar_business_selector(storage)
+    except RuntimeError as exc:
+        render_supabase_setup_help(exc)
     st.sidebar.divider()
     menu = sidebar_tree_menu()
     st.sidebar.divider()
