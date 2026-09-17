@@ -289,7 +289,7 @@ def select_trade_account(
     """증권사 선택. 없으면 신규 생성."""
     accounts = storage.list_accounts(business_id, market=market)
     names = [a.name for a in accounts]
-    create_opt = "➕ 증권사 직접 입력"
+    create_opt = "(직접 입력)"
     options = [*names, create_opt] if names else [create_opt]
     default_idx = 0
     detected = (detected_name or "").strip()
@@ -2129,7 +2129,7 @@ def page_ingest(
     elif method == "예전 매매일지":
         st.caption("시트별 '주식 매매일지'로 만들어 둔 예전 엑셀.")
         page_legacy_journal(storage, business_id, market=market)
-    else:
+    elif method == "직접 입력":
         st.caption("한 건씩 매수·매도를 직접 넣습니다.")
         page_trades(storage, business_id, market=market)
 
@@ -2316,8 +2316,7 @@ def render_overseas_trade_input(storage: Storage, business_id: int | None) -> No
         storage, int(business_id), MARKET_OVERSEAS, key="ov_trade_account"
     )
     if account is None:
-        st.warning("증권사/계좌를 선택하거나 이름을 입력하세요.")
-        return
+        st.info("증권사/계좌에서 **(직접 입력)** 을 고른 뒤 증권사명을 입력하세요.")
 
     if st.session_state.pop("_show_ov_trade_toast", False):
         st.toast(st.session_state.pop("_ov_trade_toast_msg", "저장되었습니다."))
@@ -2430,6 +2429,8 @@ def render_overseas_trade_input(storage: Storage, business_id: int | None) -> No
 
     if st.button("💾 해외주식 거래 저장", type="primary", use_container_width=True, key="ov_save"):
         try:
+            if account is None:
+                raise ValueError("증권사/계좌를 선택하거나 증권사명을 입력하세요.")
             if not ticker:
                 raise ValueError("티커(종목코드)를 입력하세요.")
             if fx_rate <= 0:
@@ -2627,9 +2628,7 @@ def page_trades(
         storage, int(business.id), market, key="dom_trade_account"
     )
     if account is None:
-        st.warning("증권사/계좌를 선택하거나 이름을 입력하세요.")
-        _render_trade_list(storage, business_id, market=market)
-        return
+        st.info("증권사/계좌에서 **(직접 입력)** 을 고른 뒤 증권사명을 입력하세요.")
 
     stock_options = [NEW_STOCK_OPTION, *[f"{s.name} ({s.code})" for s in stocks]]
     preferred = st.session_state.get("_preferred_stock")
@@ -2703,6 +2702,8 @@ def page_trades(
 
     if submitted:
         try:
+            if account is None:
+                raise ValueError("증권사/계좌를 선택하거나 증권사명을 입력하세요.")
             if quantity <= 0:
                 raise ValueError("수량은 1주 이상 입력하세요.")
             if price < 0:
