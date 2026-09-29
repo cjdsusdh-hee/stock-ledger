@@ -799,6 +799,15 @@ class Storage:
     def delete_trade(self, trade_id: int) -> None:
         self._delete("trades", eq={"id": int(trade_id)})
 
+    def delete_trades(self, trade_ids: list[int]) -> int:
+        """매매 거래 다건 삭제."""
+        if not trade_ids:
+            return 0
+        n = 0
+        for tid in trade_ids:
+            n += self._delete("trades", eq={"id": int(tid)})
+        return n
+
     def update_trade_settlement_fx(self, *args, **kwargs) -> None:
         """기존 거래 수치 변경은 차단되어 있다."""
         raise RuntimeError("기존 거래의 settlement_fx/memo 변경은 차단되어 있습니다.")

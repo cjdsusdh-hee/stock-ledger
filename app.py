@@ -1131,6 +1131,29 @@ def show_stock_detail_modal(
             except Exception as exc:  # noqa: BLE001
                 st.error(str(exc))
 
+    with st.expander("🗑️ 거래 삭제", expanded=False):
+        st.caption("표에 보이는 거래 중 잘못 올린 건을 체크해 삭제할 수 있습니다.")
+        delete_src = df_stock_trades.copy()
+        if "ID" not in delete_src.columns:
+            st.info("거래 ID가 없어 삭제할 수 없습니다.")
+        else:
+            manage = _trade_manage_view(delete_src)
+            del_key = f"stock_detail_del_{business_name}_{account_name}_{stock_name}"
+            edited_del = st.data_editor(
+                manage,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                key=del_key,
+                disabled=[c for c in manage.columns if c != "선택"],
+                column_config=_trade_manage_column_config(),
+            )
+            _render_trade_delete_actions(
+                storage,
+                edited_del,
+                key_prefix=del_key,
+            )
+
 
 def _open_stock_detail_from_query(
     storage: Storage,
@@ -2524,53 +2547,8 @@ def render_overseas_trade_input(storage: Storage, business_id: int | None) -> No
 
 
 def _render_overseas_trade_list(storage: Storage, business_id: int | None) -> None:
-    st.subheader("해외주식 거래 내역")
-    trades = storage.list_trades(business_id=business_id, market=MARKET_OVERSEAS)
-    if not trades:
-        st.info("해외주식 거래 내역이 없습니다.")
-        return
-    rows = []
-    for t in reversed(trades[-200:]):
-        rows.append(
-            {
-                "ID": t.id,
-                "거래일자": t.trade_date,
-                "증권사": getattr(t, "account_name", "") or "",
-                "유형": (
-                    "매수"
-                    if t.side == "BUY"
-                    else ("매도" if t.side == "SELL" else "배당")
-                ),
-                "티커": t.stock_code,
-                "종목명": t.stock_name,
-                "수량": t.quantity,
-                "거래금액(원가)": float(t.quantity or 0) * float(t.price or 0),
-                "외화단가": getattr(t, "price_fx", 0) or 0,
-                "환율": getattr(t, "fx_rate", 0) or 0,
-                "통화": getattr(t, "currency", "") or "",
-                "원화단가": t.price,
-                "원화수수료": t.fee,
-                "원화장산": t.settlement_amount,
-            }
-        )
-    odf = pd.DataFrame(rows)
-    st.dataframe(
-        odf,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "수량": st.column_config.NumberColumn("수량", format="%,.4f"),
-            "거래금액(원가)": st.column_config.NumberColumn(
-                "거래금액(원가)", format="%,d 원", help="수량 × 원화단가"
-            ),
-            "외화단가": st.column_config.NumberColumn("외화단가", format="%.4f"),
-            "환율": st.column_config.NumberColumn("환율", format="%.2f"),
-            "원화단가": st.column_config.NumberColumn("원화단가", format="%,d 원"),
-            "원화수수료": st.column_config.NumberColumn("원화수수료", format="%,d 원"),
-            "원화장산": st.column_config.NumberColumn("원화장산", format="%,d 원"),
-            "ID": st.column_config.NumberColumn("ID", format="%d"),
-        },
-    )
+    _render_trade_list(storage, business_id, market=MARKET_OVERSEAS)
+
 
 def page_trades(
     storage: Storage,
@@ -2798,18 +2776,10 @@ def page_trades(
     _render_trade_list(storage, business_id, market=market)
 
 
-def _render_trade_list(
-    storage: Storage,
-    business_id: int | None,
-    market: str = MARKET_DOMESTIC,
-) -> None:
-    st.subheader("거래 내역")
-    trades = storage.list_trades(business_id=business_id, market=market)
-    df = trades_to_dataframe(trades)
+def _trade_manage_view(df: pd.DataFrame) -> pd.DataFrame:
+    """거래 삭제·확인용 표 (체크박스 + 주요 컬럼)."""
     if df.empty:
-        st.info("거래 내역이 없습니다.")
-        return
-
+        return df
     view = df.drop(columns=["출처"], errors="ignore").copy()
     for col in (
         "수량",
@@ -2827,9 +2797,11 @@ def _render_trade_list(
     ):
         if col in view.columns:
             view[col] = pd.to_numeric(view[col], errors="coerce")
-
-    # 표시 순서: 원본 엑셀과 같이 수량 뒤에 외화 칸
+    if "선택" not in view.columns:
+        view.insert(0, "선택", False)
     preferred = [
+        "선택",
+        "ID",
         "거래일자",
         "사업자",
         "증권사",
@@ -2849,25 +2821,93 @@ def _render_trade_list(
         "제세금",
         "정산금액",
         "메모",
-        "ID",
     ]
     ordered = [c for c in preferred if c in view.columns]
     ordered += [c for c in view.columns if c not in ordered]
-    view = view.loc[:, ordered]
+    return view.loc[:, ordered]
 
-    st.dataframe(
+
+def _trade_manage_column_config() -> dict:
+    cfg = trade_table_column_config()
+    cfg["선택"] = st.column_config.CheckboxColumn("선택", default=False, help="삭제할 행")
+    return cfg
+
+
+def _render_trade_delete_actions(
+    storage: Storage,
+    edited: pd.DataFrame,
+    *,
+    key_prefix: str,
+    confirm_label: str = "선택한 거래 삭제를 확인했습니다. 되돌릴 수 없습니다.",
+) -> None:
+    """체크된 거래 ID를 삭제."""
+    if edited.empty or "ID" not in edited.columns:
+        return
+    st.caption(
+        "잘못 올린 거래는 **선택** 칸을 체크한 뒤 삭제하세요. "
+        "삭제하면 FIFO 잔고·회계전표 대상에서도 빠집니다."
+    )
+    confirm = st.checkbox(confirm_label, key=f"{key_prefix}_del_confirm")
+    if st.button(
+        "🗑️ 선택 거래 삭제",
+        type="secondary",
+        use_container_width=True,
+        key=f"{key_prefix}_del_btn",
+    ):
+        if not confirm:
+            st.warning("삭제 확인 체크박스를 선택해 주세요.")
+            return
+        ids = [
+            int(x)
+            for x in edited.loc[edited["선택"] == True, "ID"].tolist()  # noqa: E712
+            if pd.notna(x) and int(x) > 0
+        ]
+        if not ids:
+            st.info("삭제할 거래를 선택해 주세요.")
+            return
+        try:
+            n = storage.delete_trades(ids)
+            st.session_state["_pending_toast"] = f"거래 {n:,}건을 삭제했습니다."
+            st.rerun()
+        except Exception as exc:  # noqa: BLE001
+            st.error(str(exc))
+
+
+def _render_trade_list(
+    storage: Storage,
+    business_id: int | None,
+    market: str = MARKET_DOMESTIC,
+) -> None:
+    market = normalize_market(market)
+    st.subheader("거래 내역")
+    if business_id is None:
+        st.caption("사업자를 선택하면 해당 사업자 거래만 표시·삭제할 수 있습니다.")
+    trades = storage.list_trades(business_id=business_id, market=market)
+    df = trades_to_dataframe(trades)
+    if df.empty:
+        st.info("거래 내역이 없습니다.")
+        return
+
+    view = _trade_manage_view(df)
+    disabled_cols = [c for c in view.columns if c != "선택"]
+    editor_key = f"trade_manage_{market}_{business_id or 'all'}"
+    edited = st.data_editor(
         view,
         use_container_width=True,
         hide_index=True,
-        column_config=trade_table_column_config(),
+        num_rows="fixed",
+        key=editor_key,
+        disabled=disabled_cols,
+        column_config=_trade_manage_column_config(),
     )
-
-    del_id = st.number_input("삭제할 거래 ID", min_value=0, step=1, value=0, key="del_trade_id")
-    if st.button("선택 거래 삭제", type="secondary"):
-        if del_id > 0:
-            storage.delete_trade(int(del_id))
-            st.success(f"거래 #{int(del_id)} 삭제")
-            st.rerun()
+    if business_id is not None:
+        _render_trade_delete_actions(
+            storage,
+            edited,
+            key_prefix=editor_key,
+        )
+    else:
+        st.info("거래 삭제는 사업자를 선택한 뒤 이용할 수 있습니다.")
 
 
 def page_import_export(
