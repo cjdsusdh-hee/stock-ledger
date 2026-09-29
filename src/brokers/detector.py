@@ -52,6 +52,7 @@ def detect_and_parse(
     *,
     default_business: str,
     broker_hint: str | None = None,
+    password: str | None = None,
 ) -> BrokerParseResult:
     ext = file_ext(filename)
 
@@ -59,7 +60,9 @@ def detect_and_parse(
     if ext == "pdf" or is_pdf_file(file_bytes, filename):
         from .mirae_overseas import parse_mirae_overseas_pdf
 
-        mirae = parse_mirae_overseas_pdf(file_bytes, filename)
+        mirae = parse_mirae_overseas_pdf(
+            file_bytes, filename, password=password
+        )
         if mirae.get("rows"):
             from .base import to_standard_frame
 
@@ -93,6 +96,7 @@ def detect_and_parse(
             filename,
             default_business=default_business,
             broker_hint=broker_hint,
+            password=password,
         )
 
     # ---- CSV / Excel ----

@@ -184,12 +184,16 @@ def _table_to_rows(
     return rows
 
 
-def _extract_tables_with_pdfplumber(file_bytes: bytes) -> tuple[list[list[list[Any]]], str]:
-    import pdfplumber
+def _extract_tables_with_pdfplumber(
+    file_bytes: bytes,
+    *,
+    password: str | None = None,
+) -> tuple[list[list[list[Any]]], str]:
+    from .pdf_io import open_pdf
 
     tables: list[list[list[Any]]] = []
     text_parts: list[str] = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+    with open_pdf(file_bytes, password=password) as pdf:
         for page in pdf.pages:
             text_parts.append(page.extract_text() or "")
             page_tables = page.extract_tables() or []
@@ -315,7 +319,12 @@ def empty_trade_rows(default_business: str, n: int = 5) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=STANDARD_EMPTY_COLUMNS)
 
 
-def _ocr_pdf_text(file_bytes: bytes, *, max_pages: int = 8) -> tuple[str, list[str]]:
+def _ocr_pdf_text(
+    file_bytes: bytes,
+    *,
+    max_pages: int = 8,
+    password: str | None = None,
+) -> tuple[str, list[str]]:
     """
     스캔(이미지) PDF용 OCR fallback.
     pytesseract + pdfplumber 페이지 렌더링을 사용한다.
@@ -329,14 +338,14 @@ def _ocr_pdf_text(file_bytes: bytes, *, max_pages: int = 8) -> tuple[str, list[s
         return "", notes
 
     try:
-        import pdfplumber
+        from .pdf_io import open_pdf
     except ImportError:
         notes.append(OCR_TIP)
         return "", notes
 
     parts: list[str] = []
     try:
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        with open_pdf(file_bytes, password=password) as pdf:
             pages = pdf.pages[:max_pages]
             if not pages:
                 notes.append("PDF 페이지가 비어 있습니다.")
@@ -380,24 +389,37 @@ def parse_broker_pdf(
     *,
     default_business: str,
     broker_hint: str | None = None,
+    password: str | None = None,
 ) -> BrokerParseResult:
     """PDF에서 표/텍스트를 추출해 표준 거래 DataFrame으로 변환."""
     try:
-        tables, text = _extract_tables_with_pdfplumber(file_bytes)
+        tables, text = _extract_tables_with_pdfplumber(
+            file_bytes, password=password
+        )
     except ImportError as exc:
         raise ImportError(
             "pdfplumber가 설치되어 있지 않습니다. "
             "`pip install pdfplumber` 후 다시 시도하세요."
         ) from exc
+    except ValueError:
+        raise
     except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"PDF를 읽을 수 없습니다: {exc}") from exc
+        from .pdf_io import pdf_open_error_message
+
+        raise ValueError(
+            pdf_open_error_message(
+                exc,
+                file_bytes=file_bytes,
+                password_attempted=bool(password),
+            )
+        ) from exc
 
     notes: list[str] = [f"PDF 페이지 텍스트 {len(text)}자, 표 {len(tables)}개 감지"]
 
     # 텍스트가 거의 없으면 스캔 PDF로 보고 OCR fallback
     if len(text.strip()) < 50:
         notes.append("텍스트 추출량이 적어(50자 미만) OCR fallback을 시도합니다.")
-        ocr_text, ocr_notes = _ocr_pdf_text(file_bytes)
+        ocr_text, ocr_notes = _ocr_pdf_text(file_bytes, password=password)
         notes.extend(ocr_notes)
         if ocr_text:
             text = f"{text}\n{ocr_text}".strip()

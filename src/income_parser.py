@@ -372,11 +372,16 @@ def parse_income_excel(file_bytes: bytes, filename: str = "") -> IncomeParseResu
     return IncomeParseResult(rows=rows, notes=notes, source="excel")
 
 
-def _extract_pdf_text(file_bytes: bytes, *, include_tables: bool = True) -> str:
-    import pdfplumber
+def _extract_pdf_text(
+    file_bytes: bytes,
+    *,
+    include_tables: bool = True,
+    password: str | None = None,
+) -> str:
+    from src.brokers.pdf_io import open_pdf
 
     parts: list[str] = []
-    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+    with open_pdf(file_bytes, password=password) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
             if text.strip():
@@ -556,12 +561,21 @@ def _kb_row_from_match(m: re.Match[str], filename: str = "") -> dict[str, Any]:
     }
 
 
-def parse_kb_interest_pdf(file_bytes: bytes, filename: str = "") -> IncomeParseResult:
+def parse_kb_interest_pdf(
+    file_bytes: bytes,
+    filename: str = "",
+    *,
+    password: str | None = None,
+) -> IncomeParseResult:
     """KB증권 CMA 계좌별 과세내역/원천징수영수증 PDF → 전체 거래 라인 추출."""
     notes: list[str] = []
     try:
         # 표 셀( | 구분)을 섞으면 라인 정규식이 깨질 수 있어 본문 텍스트만 사용
-        raw = _extract_pdf_text(file_bytes, include_tables=False)
+        raw = _extract_pdf_text(
+            file_bytes, include_tables=False, password=password
+        )
+    except ValueError as exc:
+        return IncomeParseResult(notes=[str(exc)], source="pdf-kb")
     except Exception as exc:  # noqa: BLE001
         return IncomeParseResult(
             notes=[f"PDF 읽기 실패: {exc}"],
@@ -625,9 +639,15 @@ _MIRAE_KRW_FEE = re.compile(
 _MIRAE_FX_FEE = re.compile(
     r"(?P<date>\d{4}/\d{2}/\d{2})\s+외화예탁금이용료입금\s+(?P<code>\S+)"
 )
-# 환율 컬럼만: `1,313.70 수지WM 07:23:10`
+# 환율 컬럼만: `1,313.70 수지WM 07:23:10` · `1,442Direct7 07:16:04`
 _MIRAE_FX_LINE = re.compile(
-    r"^(?P<fx>[\d,]+\.\d+)\s+(?:Direct|(?P<branch>\S+)\s+(?P<time>\d{1,2}:\d{2}(?::\d{2})?))",
+    r"^(?P<fx>[\d,]+(?:\.\d+)?)"
+    r"(?:"
+    r"\s+(?:(?:Direct\d*)|\S+)\s+"
+    r"|"
+    r"(?:(?:Direct\d*)|[^\d\s]+)\s+"
+    r")"
+    r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?)$",
     re.I,
 )
 
@@ -658,13 +678,20 @@ def _is_mirae_trade_certificate(text: str, filename: str = "") -> bool:
 
 
 def parse_mirae_trade_certificate_income(
-    file_bytes: bytes, filename: str = ""
+    file_bytes: bytes,
+    filename: str = "",
+    *,
+    password: str | None = None,
 ) -> IncomeParseResult:
     """미래에셋 '거래실적 증명서'에서 배당·예탁금이용료만 추출 → 이자·배당 내역."""
     notes: list[str] = []
     try:
         # 표 셀 혼합 시 라인 패턴이 깨지므로 본문 텍스트만 사용
-        text = _extract_pdf_text(file_bytes, include_tables=False)
+        text = _extract_pdf_text(
+            file_bytes, include_tables=False, password=password
+        )
+    except ValueError as exc:
+        return IncomeParseResult(notes=[str(exc)], source="pdf-mirae-cert")
     except Exception as exc:  # noqa: BLE001
         return IncomeParseResult(
             notes=[f"PDF 읽기 실패: {exc}"],
@@ -806,11 +833,21 @@ def parse_mirae_trade_certificate_income(
     return IncomeParseResult(rows=rows, notes=notes, source="pdf-mirae-cert")
 
 
-def parse_income_pdf(file_bytes: bytes, filename: str = "") -> IncomeParseResult:
+def parse_income_pdf(
+    file_bytes: bytes,
+    filename: str = "",
+    *,
+    password: str | None = None,
+) -> IncomeParseResult:
     """원천징수영수증 PDF 파싱. KB 계좌별과세내역·미래에셋 거래실적증명서 전용 파서 우선."""
     notes: list[str] = []
     try:
-        text = _extract_pdf_text(file_bytes)
+        text = _extract_pdf_text(file_bytes, password=password)
+    except ValueError as exc:
+        return IncomeParseResult(
+            notes=[str(exc), "엑셀 양식으로 업로드하거나 수동 입력해 주세요."],
+            source="pdf",
+        )
     except Exception as exc:  # noqa: BLE001
         return IncomeParseResult(
             notes=[f"PDF 읽기 실패: {exc}", "엑셀 양식으로 업로드하거나 수동 입력해 주세요."],
@@ -824,13 +861,15 @@ def parse_income_pdf(file_bytes: bytes, filename: str = "") -> IncomeParseResult
         )
 
     if _is_mirae_trade_certificate(text, filename):
-        mirae = parse_mirae_trade_certificate_income(file_bytes, filename)
+        mirae = parse_mirae_trade_certificate_income(
+            file_bytes, filename, password=password
+        )
         if mirae.rows:
             return mirae
         notes.extend(mirae.notes)
 
     if _is_kb_withholding_pdf(text, filename):
-        kb = parse_kb_interest_pdf(file_bytes, filename)
+        kb = parse_kb_interest_pdf(file_bytes, filename, password=password)
         if kb.rows:
             return kb
         notes.extend(kb.notes)
@@ -889,10 +928,15 @@ def parse_income_pdf(file_bytes: bytes, filename: str = "") -> IncomeParseResult
     return IncomeParseResult(rows=rows, notes=notes, source="pdf")
 
 
-def parse_income_file(file_bytes: bytes, filename: str) -> IncomeParseResult:
+def parse_income_file(
+    file_bytes: bytes,
+    filename: str,
+    *,
+    password: str | None = None,
+) -> IncomeParseResult:
     name = (filename or "").lower()
     if name.endswith(".pdf"):
-        return parse_income_pdf(file_bytes, filename)
+        return parse_income_pdf(file_bytes, filename, password=password)
     return parse_income_excel(file_bytes, filename)
 
 

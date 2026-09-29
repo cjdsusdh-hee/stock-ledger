@@ -83,14 +83,18 @@ def _page_word_lines(page: Any) -> str:
     return "\n".join(lines)
 
 
-def _extract_text_candidates(file_bytes: bytes) -> list[str]:
-    import pdfplumber
+def _extract_text_candidates(
+    file_bytes: bytes,
+    *,
+    password: str | None = None,
+) -> list[str]:
+    from .pdf_io import open_pdf
 
     default_parts: list[str] = []
     layout_parts: list[str] = []
     word_parts: list[str] = []
     table_parts: list[str] = []
-    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+    with open_pdf(file_bytes, password=password) as pdf:
         for page in pdf.pages:
             default_parts.append(page.extract_text() or "")
             try:
@@ -119,9 +123,37 @@ def _mirae_kind_score(text: str) -> int:
     return sum((text or "").count(k) for k in _KINDS)
 
 
-def _extract_text(file_bytes: bytes) -> str:
+def _hangul_count(text: str) -> int:
+    return sum(1 for c in (text or "") if "\uac00" <= c <= "\ud7a3")
+
+
+def _text_is_cid_garbage(text: str) -> bool:
+    """인쇄·PDF저장 등으로 ToUnicode가 없는 PDF → (cid:0)… 만 나오는 경우."""
+    blob = text or ""
+    if not blob.strip():
+        return False
+    if _hangul_count(blob) >= 20:
+        return False
+    if _mirae_kind_score(_normalize_mirae_text(blob)) >= 3:
+        return False
+    cid = blob.count("(cid:")
+    if cid >= 10:
+        return True
+    return cid > 0 and _hangul_count(blob) == 0 and len(blob) > 80
+
+
+CID_PDF_HELP = (
+    "이 PDF는 **인쇄·「PDF로 저장」** 으로 만든 파일로 보입니다. "
+    "글자 정보가 (cid:0) 형태로 깨져 있어 '해외주식매수입고' 등을 읽을 수 없습니다.\n\n"
+    "**해결:** 미래에셋 MTS/HTS에서 **거래내역서를 파일로 다운로드** 받아 업로드하세요. "
+    "예전에 성공했던 `미래에셋(3074-6494-01)…` 처럼 **다운로드 PDF**(용량 약 1~2MB, "
+    "텍스트 선택 가능)여야 합니다. 브라우저·프린터로 저장한 PDF(10MB 이상)는 인식되지 않습니다."
+)
+
+
+def _extract_text(file_bytes: bytes, *, password: str | None = None) -> str:
     scored: list[tuple[int, int, str]] = []
-    for idx, raw in enumerate(_extract_text_candidates(file_bytes)):
+    for idx, raw in enumerate(_extract_text_candidates(file_bytes, password=password)):
         norm = _normalize_mirae_text(raw)
         scored.append((_mirae_kind_score(norm), idx, norm))
     scored.sort(key=lambda x: (-x[0], x[1]))
@@ -139,9 +171,17 @@ _HEADER = re.compile(
 )
 _DATE_ONLY = re.compile(r"^(?P<date>\d{4}[./-]\d{1,2}[./-]\d{1,2})(?!\d)\b")
 
-# 환율 컬럼만 인정: `1,313.70 수지WM 07:23:10` 또는 `… Direct`
+# 환율 컬럼만 인정 (단가·금액 숫자와 구분):
+# - 구형: `1,313.70 수지WM 07:23:10`
+# - 신형: `1,442Direct7 07:16:04`, `1,384.6증권결제팀 16:44:05`
 _FX_LINE = re.compile(
-    r"^(?P<fx>[\d,]+\.\d+)\s+(?:Direct|(?P<branch>\S+)\s+(?P<time>\d{1,2}:\d{2}(?::\d{2})?))",
+    r"^(?P<fx>[\d,]+(?:\.\d+)?)"
+    r"(?:"
+    r"\s+(?:(?:Direct\d*)|\S+)\s+"
+    r"|"
+    r"(?:(?:Direct\d*)|[^\d\s]+)\s+"
+    r")"
+    r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?)$",
     re.I,
 )
 
@@ -259,15 +299,34 @@ def _parse_div_detail(line: str, header_gross: float) -> dict[str, Any] | None:
     return {"name": name, "tax": tax, "net": net, "ccy": ccy}
 
 
-def parse_mirae_overseas_pdf(file_bytes: bytes, filename: str = "") -> dict[str, Any]:
+def parse_mirae_overseas_pdf(
+    file_bytes: bytes,
+    filename: str = "",
+    *,
+    password: str | None = None,
+) -> dict[str, Any]:
     """미래에셋 해외주식 거래내역서 → 표준 행 리스트."""
     notes: list[str] = []
     try:
-        text = _extract_text(file_bytes)
-    except Exception as exc:  # noqa: BLE001
+        text = _extract_text(file_bytes, password=password)
+    except ValueError as exc:
         return {
             "rows": [],
-            "notes": [f"PDF 읽기 실패: {exc}"],
+            "notes": [str(exc)],
+            "source": "mirae-overseas-pdf",
+        }
+    except Exception as exc:  # noqa: BLE001
+        from .pdf_io import pdf_open_error_message
+
+        return {
+            "rows": [],
+            "notes": [
+                pdf_open_error_message(
+                    exc,
+                    file_bytes=file_bytes,
+                    password_attempted=bool(password),
+                )
+            ],
             "source": "mirae-overseas-pdf",
         }
 
@@ -277,6 +336,26 @@ def parse_mirae_overseas_pdf(file_bytes: bytes, filename: str = "") -> dict[str,
             "notes": ["PDF에서 텍스트를 추출하지 못했습니다."],
             "source": "mirae-overseas-pdf",
         }
+
+    if _text_is_cid_garbage(text):
+        from .pdf_parser import OCR_TIP, _ocr_pdf_text
+
+        notes.append(CID_PDF_HELP)
+        ocr_text, ocr_notes = _ocr_pdf_text(
+            file_bytes, max_pages=24, password=password
+        )
+        notes.extend(ocr_notes)
+        if ocr_text.strip() and not _text_is_cid_garbage(ocr_text):
+            text = _normalize_mirae_text(ocr_text)
+            notes.append("OCR로 텍스트를 읽었습니다. 내용을 꼭 검수하세요.")
+        else:
+            if OCR_TIP not in notes:
+                notes.append(OCR_TIP)
+            return {
+                "rows": [],
+                "notes": notes,
+                "source": "mirae-overseas-pdf",
+            }
 
     if (
         "미래에셋" not in text

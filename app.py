@@ -364,6 +364,29 @@ def show_uploaded_file(name: str | None, size: int = 0) -> None:
     st.success(f"파일 선택됨: **{name}** ({int(size):,}바이트)")
 
 
+def render_pdf_password_field(key: str) -> str | None:
+    """암호 PDF용 선택 입력. 일반 PDF는 비워 둔다."""
+    pw = st.text_input(
+        "PDF 암호 (선택 · 암호 PDF만)",
+        type="password",
+        key=key,
+        help="PDF 수신 안내(문자·메일)에 적힌 암호. 일반 거래내역 PDF는 비워 두세요.",
+    )
+    return (pw or "").strip() or None
+
+
+def warn_if_encrypted_pdf(file_bytes: bytes | None) -> None:
+    if not file_bytes:
+        return
+    from src.brokers.pdf_io import is_pdf_bytes, is_pdf_encrypted
+
+    if is_pdf_bytes(file_bytes) and is_pdf_encrypted(file_bytes):
+        st.warning(
+            "업로드한 PDF에 **암호가 걸려** 있습니다. "
+            "아래 **PDF 암호** 입력란에 수신 안내 암호를 입력한 뒤 파싱하세요."
+        )
+
+
 INGEST_DONE_KEY = "_ingest_done"
 
 
@@ -3246,15 +3269,26 @@ def page_broker_overseas(storage: Storage) -> None:
     )
     up_name, up_size, up_bytes = take_uploaded_file(up, "_ov_broker_file")
     show_uploaded_file(up_name, up_size)
+    warn_if_encrypted_pdf(up_bytes)
+    pdf_password = render_pdf_password_field("ov_broker_pdf_password")
+    if up_name and not up_bytes:
+        st.warning(
+            "파일 이름만 보이고 내용이 비어 있습니다. "
+            "브라우저 **새로고침(F5)** 후 파일을 다시 선택하세요. "
+            "(뒤로/앞으로 가기 직후 Streamlit Cloud에서 자주 발생합니다.)"
+        )
 
+    force_reparse = st.session_state.pop("ov_broker_force_reparse", False)
     if up_bytes and up_name:
-        token = f"{up_name}:{up_size}:{biz}:mirae_pdf_v2"
-        if st.session_state.get("ov_broker_token") != token:
+        token = f"{up_name}:{up_size}:{biz}:mirae_pdf_v4:{pdf_password or ''}"
+        if force_reparse or st.session_state.get("ov_broker_token") != token:
             ext = up_name.rsplit(".", 1)[-1].lower() if "." in up_name else ""
             try:
                 with st.spinner("파일을 읽는 중…"):
                     if ext == "pdf" or up_bytes[:4] == b"%PDF":
-                        result = parse_mirae_overseas_pdf(up_bytes, up_name)
+                        result = parse_mirae_overseas_pdf(
+                            up_bytes, up_name, password=pdf_password
+                        )
                     elif looks_like_columnar_overseas_excel(up_bytes, up_name):
                         result = parse_generic_overseas_excel(up_bytes, up_name)
                     else:
@@ -3266,7 +3300,8 @@ def page_broker_overseas(storage: Storage) -> None:
                         if ext == "pdf" or up_bytes[:4] == b"%PDF":
                             notes.append(
                                 f"이 PDF({up_name})에서 해외주식 매수·매도를 찾지 못했습니다. "
-                                "미래에셋 '해외주식 거래내역서'인지 확인하세요."
+                                "미래에셋 '해외주식 거래내역서' PDF인지, "
+                                "국내주식·다른 증권사 파일을 **해외주식** 메뉴에 올리지 않았는지 확인하세요."
                             )
                         else:
                             notes.append(
@@ -3282,7 +3317,11 @@ def page_broker_overseas(storage: Storage) -> None:
                     "notes": [f"파일 처리 중 오류: {exc}"],
                     "source": "overseas-error",
                 }
-            st.session_state.ov_broker_token = token
+            row_count = len(result.get("rows") or [])
+            if row_count > 0:
+                st.session_state.ov_broker_token = token
+            else:
+                st.session_state.pop("ov_broker_token", None)
             st.session_state.ov_broker_notes = result.get("notes") or []
             st.session_state.ov_broker_source = result.get("source") or "overseas"
             st.session_state.ov_broker_df = mirae_rows_to_preview_df(
@@ -3304,6 +3343,11 @@ def page_broker_overseas(storage: Storage) -> None:
                     "파일을 받았지만 거래를 추출하지 못했습니다. "
                     "거래일자·매매구분·수량·단가가 있는 엑셀인지 확인하세요."
                 )
+            if up_bytes and up_name:
+                if st.button("🔄 다시 파싱", key="ov_broker_reparse"):
+                    st.session_state["ov_broker_force_reparse"] = True
+                    st.session_state.pop("ov_broker_token", None)
+                    st.rerun()
         else:
             st.info("PDF 또는 엑셀을 업로드하면 파싱 미리보기가 표시됩니다.")
         return
@@ -3585,10 +3629,12 @@ def page_broker(
     )
     up_name, up_size, up_bytes = take_uploaded_file(up, "_broker_file")
     show_uploaded_file(up_name, up_size)
+    warn_if_encrypted_pdf(up_bytes)
+    pdf_password = render_pdf_password_field("dom_broker_pdf_password")
 
     if up_bytes and up_name:
         file_ext = up_name.split(".")[-1].lower().strip()
-        file_token = f"{up_name}:{up_size}:{broker}:{biz}:{file_ext}"
+        file_token = f"{up_name}:{up_size}:{broker}:{biz}:{file_ext}:{pdf_password or ''}"
         if st.session_state.get("broker_parse_token") != file_token:
             try:
                 with st.spinner("파일을 변환하는 중…"):
@@ -3603,6 +3649,7 @@ def page_broker(
                         up_name if file_ext != "pdf" or up_name.lower().endswith(".pdf") else f"{up_name}.pdf",
                         default_business=biz,
                         broker_hint=broker,
+                        password=pdf_password,
                     )
                 edited = result.dataframe.copy()
                 if "거래유형" in edited.columns:
@@ -4808,11 +4855,15 @@ def page_income(storage: Storage, business_id: int | None) -> None:
     )
     up_name, up_size, up_bytes = take_uploaded_file(uploaded, "_income_file")
     show_uploaded_file(up_name, up_size)
+    warn_if_encrypted_pdf(up_bytes)
+    pdf_password = render_pdf_password_field("income_pdf_password")
     if up_bytes and up_name:
-        token = f"{up_name}:{up_size}"
+        token = f"{up_name}:{up_size}:{pdf_password or ''}"
         if st.session_state.get("income_upload_token") != token:
             with st.spinner("원천징수 파일을 읽는 중…"):
-                result = parse_income_file(up_bytes, up_name)
+                result = parse_income_file(
+                    up_bytes, up_name, password=pdf_password
+                )
             for note in result.notes:
                 st.info(note)
             if result.rows:
