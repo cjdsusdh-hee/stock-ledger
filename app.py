@@ -1137,22 +1137,12 @@ def show_stock_detail_modal(
         if "ID" not in delete_src.columns:
             st.info("거래 ID가 없어 삭제할 수 없습니다.")
         else:
-            manage = _trade_manage_view(delete_src)
             del_key = f"stock_detail_del_{business_name}_{account_name}_{stock_name}"
-            edited_del = st.data_editor(
-                manage,
-                use_container_width=True,
-                hide_index=True,
-                num_rows="fixed",
-                key=del_key,
-                disabled=[c for c in manage.columns if c != "선택"],
-                column_config=_trade_manage_column_config(),
-            )
-            _render_trade_delete_actions(
+            _render_trade_manage_editor(
                 get_storage(),
-                edited_del,
-                key_prefix=del_key,
+                delete_src,
                 editor_key=del_key,
+                allow_delete=True,
             )
 
 
@@ -2812,6 +2802,123 @@ def _selected_trade_ids(df: pd.DataFrame) -> list[int]:
     return sorted({int(i) for i in ids.tolist() if int(i) > 0})
 
 
+def _ensure_trade_editor_row_numbers(view: pd.DataFrame) -> pd.DataFrame:
+    """범위 선택용 1-based 행 번호."""
+    if view.empty:
+        return view
+    out = view.copy()
+    insert_at = 1 if "선택" in out.columns else 0
+    if "행" not in out.columns:
+        out.insert(insert_at, "행", range(1, len(out) + 1))
+    else:
+        out["행"] = range(1, len(out) + 1)
+    return out
+
+
+def _apply_trade_bulk_selection(
+    df: pd.DataFrame,
+    *,
+    mode: str,
+    row_from: int = 1,
+    row_to: int = 1,
+    append: bool = False,
+) -> pd.DataFrame:
+    out = df.copy()
+    if "선택" not in out.columns:
+        out.insert(0, "선택", False)
+    if mode == "all":
+        out["선택"] = True
+    elif mode == "none":
+        out["선택"] = False
+    elif mode == "range" and "행" in out.columns:
+        lo, hi = sorted((int(row_from), int(row_to)))
+        mask = out["행"].between(lo, hi)
+        if not append:
+            out["선택"] = False
+        out.loc[mask, "선택"] = True
+    return out
+
+
+def _prime_trade_editor_selection(editor_key: str, view: pd.DataFrame) -> pd.DataFrame:
+    """전체/범위 선택 버튼 클릭 결과를 data_editor session_state에 반영."""
+    pending_key = f"{editor_key}_pending_sel"
+    pending = st.session_state.pop(pending_key, None)
+    display = _coalesce_data_editor_df(editor_key, view)
+    if len(display) != len(view):
+        display = view.copy()
+    elif "행" in view.columns and "행" in display.columns:
+        display["행"] = view["행"].values
+    if pending is None:
+        return display
+    if pending == "all":
+        updated = _apply_trade_bulk_selection(display, mode="all")
+    elif pending == "none":
+        updated = _apply_trade_bulk_selection(display, mode="none")
+    elif isinstance(pending, (list, tuple)) and pending and pending[0] == "range":
+        updated = _apply_trade_bulk_selection(
+            display,
+            mode="range",
+            row_from=int(pending[1]),
+            row_to=int(pending[2]),
+            append=bool(pending[3]) if len(pending) > 3 else False,
+        )
+    else:
+        return display
+    st.session_state[editor_key] = updated
+    return updated
+
+
+def _queue_trade_bulk_selection(editor_key: str, pending: object) -> None:
+    st.session_state[f"{editor_key}_pending_sel"] = pending
+    st.rerun()
+
+
+def _render_trade_selection_toolbar(key_prefix: str, editor_key: str, n_rows: int) -> None:
+    """전체 선택 · 행 범위 선택 (Excel Shift+클릭과 동일)."""
+    max_row = max(1, n_rows)
+    c1, c2, c3, c4, c5, c6 = st.columns([1.05, 1.05, 0.75, 0.75, 0.85, 1.05])
+    with c1:
+        if st.button("☑ 전체 선택", key=f"{key_prefix}_sel_all", use_container_width=True):
+            _queue_trade_bulk_selection(editor_key, "all")
+    with c2:
+        if st.button("☐ 전체 해제", key=f"{key_prefix}_sel_none", use_container_width=True):
+            _queue_trade_bulk_selection(editor_key, "none")
+    with c3:
+        row_from = st.number_input(
+            "시작 행",
+            min_value=1,
+            max_value=max_row,
+            value=1,
+            step=1,
+            key=f"{key_prefix}_row_from",
+        )
+    with c4:
+        row_to = st.number_input(
+            "끝 행",
+            min_value=1,
+            max_value=max_row,
+            value=max_row,
+            step=1,
+            key=f"{key_prefix}_row_to",
+        )
+    with c5:
+        append_range = st.checkbox(
+            "범위 추가",
+            key=f"{key_prefix}_range_append",
+            help="체크하면 기존 선택에 구간을 추가 (Ctrl+클릭과 유사)",
+        )
+    with c6:
+        if st.button("↕ 범위 선택", key=f"{key_prefix}_sel_range", use_container_width=True):
+            _queue_trade_bulk_selection(
+                editor_key,
+                ("range", int(row_from), int(row_to), append_range),
+            )
+    st.caption(
+        "표 **행** 번호로 연속 구간 선택 — Excel **Shift+클릭**과 같습니다. "
+        "**범위 추가**는 Ctrl+클릭처럼 기존 선택에 더합니다."
+    )
+
+
 def _trade_pick_labels(df: pd.DataFrame) -> dict[str, int]:
     labels: dict[str, int] = {}
     if df.empty or "ID" not in df.columns:
@@ -2885,7 +2992,52 @@ def _trade_manage_view(df: pd.DataFrame) -> pd.DataFrame:
 def _trade_manage_column_config() -> dict:
     cfg = trade_table_column_config()
     cfg["선택"] = st.column_config.CheckboxColumn("선택", default=False, help="삭제할 행")
+    cfg["행"] = st.column_config.NumberColumn(
+        "행",
+        format="%d",
+        help="범위 선택 기준 (1부터)",
+    )
     return cfg
+
+
+def _render_trade_manage_editor(
+    storage: Storage,
+    df: pd.DataFrame,
+    *,
+    editor_key: str,
+    allow_delete: bool = True,
+) -> None:
+    """거래 삭제용 표 + 선택 도구 + 삭제 폼."""
+    if df.empty:
+        st.info("거래 내역이 없습니다.")
+        return
+    if "ID" not in df.columns:
+        st.info("거래 ID가 없어 삭제할 수 없습니다.")
+        return
+
+    view = _ensure_trade_editor_row_numbers(_trade_manage_view(df))
+    display = _prime_trade_editor_selection(editor_key, view)
+    _render_trade_selection_toolbar(editor_key, editor_key, len(view))
+
+    disabled_cols = [c for c in display.columns if c != "선택"]
+    edited = st.data_editor(
+        display,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        key=editor_key,
+        disabled=disabled_cols,
+        column_config=_trade_manage_column_config(),
+    )
+    if allow_delete:
+        _render_trade_delete_actions(
+            storage,
+            edited,
+            key_prefix=editor_key,
+            editor_key=editor_key,
+        )
+    else:
+        st.info("거래 삭제는 사업자를 선택한 뒤 이용할 수 있습니다.")
 
 
 def _render_trade_delete_actions(
@@ -2900,18 +3052,36 @@ def _render_trade_delete_actions(
     if edited.empty or "ID" not in edited.columns:
         return
     st.caption(
-        "잘못 올린 거래는 **선택** 칸을 체크하거나 아래 목록에서 고른 뒤 삭제하세요. "
+        "위 **전체 선택** · **범위 선택** · 표 **선택** 체크 · 아래 목록 중 하나로 고른 뒤 삭제하세요. "
         "삭제하면 FIFO 잔고·회계전표 대상에서도 빠집니다."
     )
     pick_labels = _trade_pick_labels(edited)
     picked_extra: list[int] = []
     if pick_labels:
-        picked_labels = st.multiselect(
-            "삭제할 거래 (목록에서 선택)",
-            options=sorted(pick_labels.keys()),
-            key=f"{key_prefix}_multipick",
-            placeholder="거래일 · 종목 · 유형 · ID",
-        )
+        pick_cols = st.columns([3, 1, 1])
+        with pick_cols[1]:
+            if st.button(
+                "목록 전체",
+                key=f"{key_prefix}_pick_all",
+                use_container_width=True,
+            ):
+                st.session_state[f"{key_prefix}_multipick"] = sorted(pick_labels.keys())
+                st.rerun()
+        with pick_cols[2]:
+            if st.button(
+                "목록 해제",
+                key=f"{key_prefix}_pick_none",
+                use_container_width=True,
+            ):
+                st.session_state[f"{key_prefix}_multipick"] = []
+                st.rerun()
+        with pick_cols[0]:
+            picked_labels = st.multiselect(
+                "삭제할 거래 (목록에서 선택)",
+                options=sorted(pick_labels.keys()),
+                key=f"{key_prefix}_multipick",
+                placeholder="거래일 · 종목 · 유형 · ID",
+            )
         picked_extra = [pick_labels[label] for label in picked_labels]
 
     with st.form(f"{key_prefix}_delete_form", clear_on_submit=False):
@@ -2958,27 +3128,13 @@ def _render_trade_list(
         st.info("거래 내역이 없습니다.")
         return
 
-    view = _trade_manage_view(df)
-    disabled_cols = [c for c in view.columns if c != "선택"]
     editor_key = f"trade_manage_{market}_{business_id or 'all'}"
-    edited = st.data_editor(
-        view,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        key=editor_key,
-        disabled=disabled_cols,
-        column_config=_trade_manage_column_config(),
+    _render_trade_manage_editor(
+        storage,
+        df,
+        editor_key=editor_key,
+        allow_delete=business_id is not None,
     )
-    if business_id is not None:
-        _render_trade_delete_actions(
-            storage,
-            edited,
-            key_prefix=editor_key,
-            editor_key=editor_key,
-        )
-    else:
-        st.info("거래 삭제는 사업자를 선택한 뒤 이용할 수 있습니다.")
 
 
 def page_import_export(
