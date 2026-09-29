@@ -167,7 +167,7 @@ def inject_sidebar_styles() -> None:
     st.markdown(SIDEBAR_CUSTOM_CSS, unsafe_allow_html=True)
 
 
-STORAGE_CACHE_VERSION = 23  # Storage API 변경 시 증가 → 캐시 무효화
+STORAGE_CACHE_VERSION = 24  # Storage API 변경 시 증가 → 캐시 무효화
 
 
 @st.cache_resource
