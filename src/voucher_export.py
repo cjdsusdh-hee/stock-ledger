@@ -312,7 +312,11 @@ def build_overseas_remark_amount(
         if mode == "qty":
             fx_amt = qty_amt
         elif mode == "excel":
-            fx_amt = stored if stored > 0 else qty_amt
+            side = str(trade.side or "").upper()
+            if side == "BUY":
+                fx_amt = _overseas_settle_fx(trade)
+            else:
+                fx_amt = stored if stored > 0 else qty_amt
         elif stored > 0:
             fx_amt = stored
         elif use_settlement_fx:
@@ -561,7 +565,10 @@ def _buy_lines(
     principal = _won(qty * price)
     fee = _won(trade.fee)
     tax = _won(getattr(trade, "tax", 0) or 0)
-    if trade.settlement_amount is not None:
+    if _is_overseas_trade(trade):
+        # 해외 매수: 증권사 대변 = 종목원금 + 수수료 (+ 제세금) — PDF 출금액과 일치
+        total_out = principal + fee + tax
+    elif trade.settlement_amount is not None:
         total_out = _won(trade.settlement_amount)
     else:
         total_out = principal + fee + tax

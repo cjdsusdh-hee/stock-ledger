@@ -248,7 +248,11 @@ def _parse_trade_detail(line: str) -> dict[str, Any] | None:
 
     if qty <= 0 or price <= 0 or not name:
         return None
-    tax = trailing[0] if trailing else 0.0
+    if len(trailing) >= 2:
+        tax = trailing[0]
+    else:
+        # 숫자 1개(수량 반복·잔고 등)는 제세금이 아님. 제세금은 보통 `0 329 824`처럼 2개 이상일 때만 앞칸.
+        tax = 0.0
     return {
         "qty": qty,
         "price": price,

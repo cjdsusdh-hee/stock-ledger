@@ -3488,10 +3488,13 @@ def page_broker_overseas(storage: Storage) -> None:
                 tax_krw = _fx_to_krw(tax_fx, fx)
                 if side == "BUY":
                     settle = qty * price_krw + fee_krw + tax_krw
+                    settlement_fx = gross_fx + fee_fx + tax_fx
                 elif side == "SELL":
                     settle = qty * price_krw - fee_krw - tax_krw
+                    settlement_fx = max(0.0, gross_fx - fee_fx - tax_fx)
                 else:
                     settle = qty * price_krw - tax_krw
+                    settlement_fx = gross_fx
 
                 broker_name = str(row.get("증권사") or "")
                 acct_blob = ov_account.name if ov_account else ""
@@ -3532,7 +3535,7 @@ def page_broker_overseas(storage: Storage) -> None:
                         price_fx=price_fx,
                         fee_fx=fee_fx,
                         tax_fx=tax_fx,
-                        settlement_fx=gross_fx,
+                        settlement_fx=settlement_fx,
                         account_id=int(ov_account.id),
                         account_name=ov_account.name,
                         account_code=ov_account.code,
