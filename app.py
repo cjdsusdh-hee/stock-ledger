@@ -2775,13 +2775,91 @@ def _coalesce_data_editor_df(key: str, fallback: pd.DataFrame) -> pd.DataFrame:
     """data_editor + 버튼 조합에서 최신 편집값을 session_state에서 읽는다."""
     raw = st.session_state.get(key)
     if raw is None:
-        return fallback
+        return fallback.copy()
     if isinstance(raw, pd.DataFrame):
-        return raw
+        return raw.copy()
+    if isinstance(raw, dict) and "edited_rows" in raw:
+        out = fallback.copy()
+        edited_rows = raw.get("edited_rows") or {}
+        if "선택" not in out.columns:
+            return out
+        sel_col = out.columns.get_loc("선택")
+        for row_pos, changes in edited_rows.items():
+            pos = int(row_pos)
+            if pos < 0 or pos >= len(out) or "선택" not in changes:
+                continue
+            out.iat[pos, sel_col] = _truthy_cell(changes["선택"])
+        return out
     try:
         return pd.DataFrame(raw)
     except Exception:  # noqa: BLE001
-        return fallback
+        return fallback.copy()
+
+
+def _trade_sel_ids_key(editor_key: str) -> str:
+    return f"{editor_key}_sel_ids"
+
+
+def _view_trade_ids(view: pd.DataFrame) -> set[int]:
+    ids = pd.to_numeric(view["ID"], errors="coerce").dropna().astype(int)
+    return {int(i) for i in ids.tolist() if int(i) > 0}
+
+
+def _row_pos_trade_ids(view: pd.DataFrame) -> dict[int, int]:
+    mapping: dict[int, int] = {}
+    if "ID" not in view.columns:
+        return mapping
+    id_col = view.columns.get_loc("ID")
+    for pos in range(len(view)):
+        tid = pd.to_numeric(view.iat[pos, id_col], errors="coerce")
+        if pd.isna(tid) or int(tid) <= 0:
+            continue
+        mapping[pos] = int(tid)
+    return mapping
+
+
+def _apply_sel_ids_to_view(view: pd.DataFrame, sel_ids: set[int]) -> pd.DataFrame:
+    out = view.copy()
+    if "선택" not in out.columns or "ID" not in out.columns:
+        return out
+    id_col = out.columns.get_loc("ID")
+    sel_col = out.columns.get_loc("선택")
+    for pos in range(len(out)):
+        tid = pd.to_numeric(out.iat[pos, id_col], errors="coerce")
+        out.iat[pos, sel_col] = (
+            not pd.isna(tid) and int(tid) in sel_ids
+        )
+    return out
+
+
+def _build_editor_editing_state(view: pd.DataFrame, sel_ids: set[int]) -> dict:
+    """Streamlit 1.32+ data_editor가 기대하는 EditingState 형식."""
+    edited_rows: dict[int, dict[str, bool]] = {}
+    if "선택" in view.columns and "ID" in view.columns:
+        id_col = view.columns.get_loc("ID")
+        for pos in range(len(view)):
+            tid = pd.to_numeric(view.iat[pos, id_col], errors="coerce")
+            selected = not pd.isna(tid) and int(tid) in sel_ids
+            edited_rows[pos] = {"선택": selected}
+    return {"edited_rows": edited_rows, "added_rows": [], "deleted_rows": []}
+
+
+def _push_trade_editor_state(
+    editor_key: str,
+    view: pd.DataFrame,
+    sel_ids: set[int],
+) -> pd.DataFrame:
+    display = _apply_sel_ids_to_view(view, sel_ids)
+    st.session_state[editor_key] = _build_editor_editing_state(display, sel_ids)
+    st.session_state[_trade_sel_ids_key(editor_key)] = set(sel_ids)
+    return display
+
+
+def _sync_trade_sel_ids_from_editor(editor_key: str, view: pd.DataFrame) -> set[int]:
+    live = _coalesce_data_editor_df(editor_key, view)
+    sel_ids = set(_selected_trade_ids(live))
+    st.session_state[_trade_sel_ids_key(editor_key)] = sel_ids
+    return sel_ids
 
 
 def _truthy_cell(value: object) -> bool:
@@ -2815,57 +2893,50 @@ def _ensure_trade_editor_row_numbers(view: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _apply_trade_bulk_selection(
-    df: pd.DataFrame,
-    *,
-    mode: str,
-    row_from: int = 1,
-    row_to: int = 1,
-    append: bool = False,
-) -> pd.DataFrame:
-    out = df.copy()
-    if "선택" not in out.columns:
-        out.insert(0, "선택", False)
-    if mode == "all":
-        out["선택"] = True
-    elif mode == "none":
-        out["선택"] = False
-    elif mode == "range" and "행" in out.columns:
-        lo, hi = sorted((int(row_from), int(row_to)))
-        mask = out["행"].between(lo, hi)
-        if not append:
-            out["선택"] = False
-        out.loc[mask, "선택"] = True
-    return out
-
-
 def _prime_trade_editor_selection(editor_key: str, view: pd.DataFrame) -> pd.DataFrame:
     """전체/범위 선택 버튼 클릭 결과를 data_editor session_state에 반영."""
     pending_key = f"{editor_key}_pending_sel"
     pending = st.session_state.pop(pending_key, None)
-    display = _coalesce_data_editor_df(editor_key, view)
-    if len(display) != len(view):
-        display = view.copy()
-    elif "행" in view.columns and "행" in display.columns:
-        display["행"] = view["행"].values
+    sel_key = _trade_sel_ids_key(editor_key)
+    all_ids = _view_trade_ids(view)
+    row_map = _row_pos_trade_ids(view)
+
+    if len(_coalesce_data_editor_df(editor_key, view)) != len(view):
+        st.session_state.pop(editor_key, None)
+        st.session_state[sel_key] = set()
+
     if pending is None:
+        display = _coalesce_data_editor_df(editor_key, view)
+        if "행" in view.columns and "행" in display.columns:
+            display["행"] = view["행"].values
+        st.session_state[sel_key] = set(_selected_trade_ids(display))
         return display
+
+    prev_sel = {
+        int(i)
+        for i in st.session_state.get(sel_key, set())
+        if int(i) in all_ids
+    }
+    sel_ids = prev_sel
     if pending == "all":
-        updated = _apply_trade_bulk_selection(display, mode="all")
+        sel_ids = set(all_ids)
     elif pending == "none":
-        updated = _apply_trade_bulk_selection(display, mode="none")
+        sel_ids = set()
     elif isinstance(pending, (list, tuple)) and pending and pending[0] == "range":
-        updated = _apply_trade_bulk_selection(
-            display,
-            mode="range",
-            row_from=int(pending[1]),
-            row_to=int(pending[2]),
-            append=bool(pending[3]) if len(pending) > 3 else False,
-        )
-    else:
-        return display
-    st.session_state[editor_key] = updated
-    return updated
+        lo, hi = sorted((int(pending[1]), int(pending[2])))
+        append = bool(pending[3]) if len(pending) > 3 else False
+        range_ids: set[int] = set()
+        if "행" in view.columns:
+            row_col = view.columns.get_loc("행")
+            for pos, tid in row_map.items():
+                row_num = pd.to_numeric(view.iat[pos, row_col], errors="coerce")
+                if pd.isna(row_num):
+                    continue
+                if lo <= int(row_num) <= hi:
+                    range_ids.add(tid)
+        sel_ids = (prev_sel | range_ids) if append else range_ids
+
+    return _push_trade_editor_state(editor_key, view, sel_ids)
 
 
 def _queue_trade_bulk_selection(editor_key: str, pending: object) -> None:
@@ -2917,6 +2988,10 @@ def _render_trade_selection_toolbar(key_prefix: str, editor_key: str, n_rows: in
         "표 **행** 번호로 연속 구간 선택 — Excel **Shift+클릭**과 같습니다. "
         "**범위 추가**는 Ctrl+클릭처럼 기존 선택에 더합니다."
     )
+    sel_key = _trade_sel_ids_key(editor_key)
+    sel_count = len(st.session_state.get(sel_key, set()))
+    if sel_count:
+        st.caption(f"현재 **{sel_count:,}건** 선택됨")
 
 
 def _trade_pick_labels(df: pd.DataFrame) -> dict[str, int]:
@@ -3029,6 +3104,7 @@ def _render_trade_manage_editor(
         disabled=disabled_cols,
         column_config=_trade_manage_column_config(),
     )
+    _sync_trade_sel_ids_from_editor(editor_key, view)
     if allow_delete:
         _render_trade_delete_actions(
             storage,
@@ -3099,7 +3175,8 @@ def _render_trade_delete_actions(
         return
 
     live = _coalesce_data_editor_df(editor_key, edited)
-    ids = sorted(set(_selected_trade_ids(live) + picked_extra))
+    sel_ids = set(st.session_state.get(_trade_sel_ids_key(editor_key), set()))
+    ids = sorted(set(_selected_trade_ids(live)) | sel_ids | set(picked_extra))
     if not ids:
         st.info("삭제할 거래를 선택해 주세요. (표 **선택** 칸 또는 위 목록)")
         return
@@ -3107,6 +3184,7 @@ def _render_trade_delete_actions(
         n = storage.delete_trades(ids)
         st.session_state["_pending_toast"] = f"거래 {n:,}건을 삭제했습니다."
         st.session_state.pop(editor_key, None)
+        st.session_state.pop(_trade_sel_ids_key(editor_key), None)
         st.session_state.pop(f"{key_prefix}_multipick", None)
         st.rerun()
     except Exception as exc:  # noqa: BLE001
