@@ -2308,6 +2308,10 @@ def page_dashboard(
         )
 
     st.subheader("처분손익")
+    st.caption(
+        "**실현손익** = 매도금액 − FIFO원가 (원화단가 기준). "
+        "**수수료**는 별도 열이며 전표에서 지급수수료로 분개됩니다."
+    )
     sell_df = sell_results_to_dataframe(period_sells)
     if sell_df.empty:
         st.info("선택한 기간의 매도(처분) 내역이 없습니다.")

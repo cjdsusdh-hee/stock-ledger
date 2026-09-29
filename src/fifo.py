@@ -76,11 +76,9 @@ class FifoEngine:
                 sell_fee_alloc = trade.fee * ratio_sell
                 sell_fee_remaining -= sell_fee_alloc
 
-                pnl = (
-                    (trade.price - lot.price) * matched
-                    - buy_fee_alloc
-                    - sell_fee_alloc
-                )
+                # 실현손익 = 매도금액(원화단가×수량) − FIFO원가.
+                # 수수료·제세금은 전표에서 별도 분개하므로 여기서 다시 빼지 않는다.
+                pnl = (trade.price - lot.price) * matched
                 realized += pnl
 
                 matches.append(
