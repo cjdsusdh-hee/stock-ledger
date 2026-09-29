@@ -805,7 +805,15 @@ class Storage:
             return 0
         n = 0
         for tid in trade_ids:
-            n += self._delete("trades", eq={"id": int(tid)})
+            try:
+                n += self._delete("trades", eq={"id": int(tid)})
+            except Exception as exc:  # noqa: BLE001
+                raise format_supabase_error(exc) from exc
+        if n == 0:
+            raise RuntimeError(
+                f"거래 {trade_ids} 가 삭제되지 않았습니다. "
+                "페이지를 새로고침한 뒤 다시 시도하거나 ID를 확인하세요."
+            )
         return n
 
     def update_trade_settlement_fx(self, *args, **kwargs) -> None:

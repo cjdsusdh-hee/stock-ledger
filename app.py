@@ -1131,7 +1131,7 @@ def show_stock_detail_modal(
             except Exception as exc:  # noqa: BLE001
                 st.error(str(exc))
 
-    with st.expander("🗑️ 거래 삭제", expanded=False):
+    with st.expander("🗑️ 거래 삭제", expanded=True):
         st.caption("표에 보이는 거래 중 잘못 올린 건을 체크해 삭제할 수 있습니다.")
         delete_src = df_stock_trades.copy()
         if "ID" not in delete_src.columns:
@@ -1149,9 +1149,10 @@ def show_stock_detail_modal(
                 column_config=_trade_manage_column_config(),
             )
             _render_trade_delete_actions(
-                storage,
+                get_storage(),
                 edited_del,
                 key_prefix=del_key,
+                editor_key=del_key,
             )
 
 
@@ -2281,6 +2282,10 @@ def page_dashboard(
             for w in warnings:
                 st.warning(w)
 
+    if business_id is not None:
+        with st.expander("🗑️ 잘못 올린 거래 삭제", expanded=False):
+            _render_trade_list(storage, business_id, market=market)
+
     st.subheader("보유 잔고")
     st.caption(
         "종목명을 클릭하면 원본 매매 내역이 열립니다. "
@@ -2776,6 +2781,56 @@ def page_trades(
     _render_trade_list(storage, business_id, market=market)
 
 
+def _coalesce_data_editor_df(key: str, fallback: pd.DataFrame) -> pd.DataFrame:
+    """data_editor + 버튼 조합에서 최신 편집값을 session_state에서 읽는다."""
+    raw = st.session_state.get(key)
+    if raw is None:
+        return fallback
+    if isinstance(raw, pd.DataFrame):
+        return raw
+    try:
+        return pd.DataFrame(raw)
+    except Exception:  # noqa: BLE001
+        return fallback
+
+
+def _truthy_cell(value: object) -> bool:
+    if value is True:
+        return True
+    if value is False or value is None:
+        return False
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        return float(value) != 0.0
+    return str(value).strip().lower() in {"true", "1", "yes", "y"}
+
+
+def _selected_trade_ids(df: pd.DataFrame) -> list[int]:
+    if df.empty or "선택" not in df.columns or "ID" not in df.columns:
+        return []
+    mask = df["선택"].map(_truthy_cell)
+    ids = pd.to_numeric(df.loc[mask, "ID"], errors="coerce").dropna().astype(int)
+    return sorted({int(i) for i in ids.tolist() if int(i) > 0})
+
+
+def _trade_pick_labels(df: pd.DataFrame) -> dict[str, int]:
+    labels: dict[str, int] = {}
+    if df.empty or "ID" not in df.columns:
+        return labels
+    for _, row in df.iterrows():
+        tid = pd.to_numeric(row.get("ID"), errors="coerce")
+        if pd.isna(tid) or int(tid) <= 0:
+            continue
+        parts = [
+            str(row.get("거래일자") or "").strip(),
+            str(row.get("종목명") or row.get("종목코드") or "").strip(),
+            str(row.get("거래유형") or "").strip(),
+            f"#{int(tid)}",
+        ]
+        label = " | ".join(p for p in parts if p)
+        labels[label or f"#{int(tid)}"] = int(tid)
+    return labels
+
+
 def _trade_manage_view(df: pd.DataFrame) -> pd.DataFrame:
     """거래 삭제·확인용 표 (체크박스 + 주요 컬럼)."""
     if df.empty:
@@ -2838,39 +2893,54 @@ def _render_trade_delete_actions(
     edited: pd.DataFrame,
     *,
     key_prefix: str,
+    editor_key: str,
     confirm_label: str = "선택한 거래 삭제를 확인했습니다. 되돌릴 수 없습니다.",
 ) -> None:
     """체크된 거래 ID를 삭제."""
     if edited.empty or "ID" not in edited.columns:
         return
     st.caption(
-        "잘못 올린 거래는 **선택** 칸을 체크한 뒤 삭제하세요. "
+        "잘못 올린 거래는 **선택** 칸을 체크하거나 아래 목록에서 고른 뒤 삭제하세요. "
         "삭제하면 FIFO 잔고·회계전표 대상에서도 빠집니다."
     )
-    confirm = st.checkbox(confirm_label, key=f"{key_prefix}_del_confirm")
-    if st.button(
-        "🗑️ 선택 거래 삭제",
-        type="secondary",
-        use_container_width=True,
-        key=f"{key_prefix}_del_btn",
-    ):
-        if not confirm:
-            st.warning("삭제 확인 체크박스를 선택해 주세요.")
-            return
-        ids = [
-            int(x)
-            for x in edited.loc[edited["선택"] == True, "ID"].tolist()  # noqa: E712
-            if pd.notna(x) and int(x) > 0
-        ]
-        if not ids:
-            st.info("삭제할 거래를 선택해 주세요.")
-            return
-        try:
-            n = storage.delete_trades(ids)
-            st.session_state["_pending_toast"] = f"거래 {n:,}건을 삭제했습니다."
-            st.rerun()
-        except Exception as exc:  # noqa: BLE001
-            st.error(str(exc))
+    pick_labels = _trade_pick_labels(edited)
+    picked_extra: list[int] = []
+    if pick_labels:
+        picked_labels = st.multiselect(
+            "삭제할 거래 (목록에서 선택)",
+            options=sorted(pick_labels.keys()),
+            key=f"{key_prefix}_multipick",
+            placeholder="거래일 · 종목 · 유형 · ID",
+        )
+        picked_extra = [pick_labels[label] for label in picked_labels]
+
+    with st.form(f"{key_prefix}_delete_form", clear_on_submit=False):
+        confirm = st.checkbox(confirm_label, key=f"{key_prefix}_del_confirm")
+        submitted = st.form_submit_button(
+            "🗑️ 선택 거래 삭제",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if not submitted:
+        return
+    if not confirm:
+        st.warning("삭제 확인 체크박스를 선택해 주세요.")
+        return
+
+    live = _coalesce_data_editor_df(editor_key, edited)
+    ids = sorted(set(_selected_trade_ids(live) + picked_extra))
+    if not ids:
+        st.info("삭제할 거래를 선택해 주세요. (표 **선택** 칸 또는 위 목록)")
+        return
+    try:
+        n = storage.delete_trades(ids)
+        st.session_state["_pending_toast"] = f"거래 {n:,}건을 삭제했습니다."
+        st.session_state.pop(editor_key, None)
+        st.session_state.pop(f"{key_prefix}_multipick", None)
+        st.rerun()
+    except Exception as exc:  # noqa: BLE001
+        st.error(str(exc))
 
 
 def _render_trade_list(
@@ -2905,6 +2975,7 @@ def _render_trade_list(
             storage,
             edited,
             key_prefix=editor_key,
+            editor_key=editor_key,
         )
     else:
         st.info("거래 삭제는 사업자를 선택한 뒤 이용할 수 있습니다.")
