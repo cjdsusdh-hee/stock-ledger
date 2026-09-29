@@ -801,18 +801,32 @@ class Storage:
 
     def delete_trades(self, trade_ids: list[int]) -> int:
         """매매 거래 다건 삭제."""
-        if not trade_ids:
+        ids = sorted({int(t) for t in trade_ids if int(t) > 0})
+        if not ids:
             return 0
-        n = 0
-        for tid in trade_ids:
-            try:
-                n += self._delete("trades", eq={"id": int(tid)})
-            except Exception as exc:  # noqa: BLE001
-                raise format_supabase_error(exc) from exc
+        try:
+            res = (
+                self._sb()
+                .table("trades")
+                .delete()
+                .in_("id", ids)
+                .select("id")
+                .execute()
+            )
+            n = len(res.data or [])
+        except Exception as exc:  # noqa: BLE001
+            raise format_supabase_error(exc) from exc
         if n == 0:
             raise RuntimeError(
-                f"거래 {trade_ids} 가 삭제되지 않았습니다. "
+                f"거래 {ids} 가 삭제되지 않았습니다. "
                 "페이지를 새로고침한 뒤 다시 시도하거나 ID를 확인하세요."
+            )
+        if n < len(ids):
+            deleted = {int(row["id"]) for row in (res.data or []) if row.get("id") is not None}
+            missing = [i for i in ids if i not in deleted]
+            raise RuntimeError(
+                f"요청 {len(ids)}건 중 {n}건만 삭제되었습니다. "
+                f"남은 ID: {missing}"
             )
         return n
 

@@ -2800,6 +2800,38 @@ def _trade_sel_ids_key(editor_key: str) -> str:
     return f"{editor_key}_sel_ids"
 
 
+def _get_trade_sel_ids(editor_key: str) -> set[int]:
+    raw = st.session_state.get(_trade_sel_ids_key(editor_key), [])
+    if isinstance(raw, set):
+        return {int(i) for i in raw if int(i) > 0}
+    return {int(i) for i in (raw or []) if int(i) > 0}
+
+
+def _set_trade_sel_ids(editor_key: str, sel_ids: set[int]) -> None:
+    st.session_state[_trade_sel_ids_key(editor_key)] = sorted(
+        {int(i) for i in sel_ids if int(i) > 0}
+    )
+
+
+def _resolve_trade_delete_ids(
+    *,
+    view: pd.DataFrame,
+    edited: pd.DataFrame,
+    widget_key: str,
+    editor_key: str,
+    picked_extra: list[int],
+) -> list[int]:
+    """삭제 대상 ID — session_state·표·목록 선택을 모두 합친다."""
+    ids = set(_get_trade_sel_ids(editor_key))
+    ids |= set(picked_extra)
+    live = _coalesce_data_editor_df(widget_key, edited)
+    ids |= set(_selected_trade_ids(live))
+    ids |= set(_selected_trade_ids(edited))
+    if not ids and not view.empty:
+        ids |= set(_selected_trade_ids(_apply_sel_ids_to_view(view, ids)))
+    return sorted(i for i in ids if i > 0)
+
+
 def _view_trade_ids(view: pd.DataFrame) -> set[int]:
     ids = pd.to_numeric(view["ID"], errors="coerce").dropna().astype(int)
     return {int(i) for i in ids.tolist() if int(i) > 0}
@@ -2848,7 +2880,7 @@ def _bump_trade_editor_widget(editor_key: str) -> str:
 def _sync_trade_sel_ids_from_editor(widget_key: str, view: pd.DataFrame, editor_key: str) -> set[int]:
     live = _coalesce_data_editor_df(widget_key, view)
     sel_ids = set(_selected_trade_ids(live))
-    st.session_state[_trade_sel_ids_key(editor_key)] = sel_ids
+    _set_trade_sel_ids(editor_key, sel_ids)
     return sel_ids
 
 
@@ -2887,31 +2919,22 @@ def _prime_trade_editor_selection(editor_key: str, view: pd.DataFrame) -> pd.Dat
     """전체/범위 선택 버튼 클릭 결과를 표 데이터·선택 ID에 반영."""
     pending_key = f"{editor_key}_pending_sel"
     pending = st.session_state.pop(pending_key, None)
-    sel_key = _trade_sel_ids_key(editor_key)
     all_ids = _view_trade_ids(view)
     row_map = _row_pos_trade_ids(view)
     widget_key = _trade_editor_widget_key(editor_key)
 
     if len(_coalesce_data_editor_df(widget_key, view)) != len(view):
         _bump_trade_editor_widget(editor_key)
-        st.session_state[sel_key] = set()
+        _set_trade_sel_ids(editor_key, set())
 
     if pending is None:
-        sel_ids = {
-            int(i)
-            for i in st.session_state.get(sel_key, set())
-            if int(i) in all_ids
-        }
+        sel_ids = _get_trade_sel_ids(editor_key) & all_ids
         if not sel_ids:
             sel_ids = set(_selected_trade_ids(_coalesce_data_editor_df(widget_key, view)))
-        st.session_state[sel_key] = sel_ids
+        _set_trade_sel_ids(editor_key, sel_ids)
         return _apply_sel_ids_to_view(view, sel_ids)
 
-    prev_sel = {
-        int(i)
-        for i in st.session_state.get(sel_key, set())
-        if int(i) in all_ids
-    }
+    prev_sel = _get_trade_sel_ids(editor_key) & all_ids
     sel_ids = prev_sel
     if pending == "all":
         sel_ids = set(all_ids)
@@ -2931,7 +2954,7 @@ def _prime_trade_editor_selection(editor_key: str, view: pd.DataFrame) -> pd.Dat
                     range_ids.add(tid)
         sel_ids = (prev_sel | range_ids) if append else range_ids
 
-    st.session_state[sel_key] = sel_ids
+    _set_trade_sel_ids(editor_key, sel_ids)
     _bump_trade_editor_widget(editor_key)
     return _apply_sel_ids_to_view(view, sel_ids)
 
@@ -2986,7 +3009,7 @@ def _render_trade_selection_toolbar(key_prefix: str, editor_key: str, n_rows: in
         "**범위 추가**는 Ctrl+클릭처럼 기존 선택에 더합니다."
     )
     sel_key = _trade_sel_ids_key(editor_key)
-    sel_count = len(st.session_state.get(sel_key, set()))
+    sel_count = len(_get_trade_sel_ids(editor_key))
     if sel_count:
         st.caption(f"현재 **{sel_count:,}건** 선택됨")
 
@@ -3102,31 +3125,35 @@ def _render_trade_manage_editor(
         disabled=disabled_cols,
         column_config=_trade_manage_column_config(),
     )
-    _sync_trade_sel_ids_from_editor(widget_key, view, editor_key)
+    delete_attempted = False
     if allow_delete:
-        _render_trade_delete_actions(
+        delete_attempted = _render_trade_delete_actions(
             storage,
             edited,
+            view=view,
             key_prefix=editor_key,
             editor_key=editor_key,
             widget_key=widget_key,
         )
     else:
         st.info("거래 삭제는 사업자를 선택한 뒤 이용할 수 있습니다.")
+    if not delete_attempted:
+        _sync_trade_sel_ids_from_editor(widget_key, view, editor_key)
 
 
 def _render_trade_delete_actions(
     storage: Storage,
     edited: pd.DataFrame,
     *,
+    view: pd.DataFrame,
     key_prefix: str,
     editor_key: str,
     widget_key: str | None = None,
     confirm_label: str = "선택한 거래 삭제를 확인했습니다. 되돌릴 수 없습니다.",
-) -> None:
-    """체크된 거래 ID를 삭제."""
+) -> bool:
+    """체크된 거래 ID를 삭제. True면 삭제 버튼 클릭(시도)됨."""
     if edited.empty or "ID" not in edited.columns:
-        return
+        return False
     st.caption(
         "위 **전체 선택** · **범위 선택** · 표 **선택** 체크 · 아래 목록 중 하나로 고른 뒤 삭제하세요. "
         "삭제하면 FIFO 잔고·회계전표 대상에서도 빠집니다."
@@ -3142,6 +3169,8 @@ def _render_trade_delete_actions(
                 use_container_width=True,
             ):
                 st.session_state[f"{key_prefix}_multipick"] = sorted(pick_labels.keys())
+                _set_trade_sel_ids(editor_key, set(pick_labels.values()))
+                _bump_trade_editor_widget(editor_key)
                 st.rerun()
         with pick_cols[2]:
             if st.button(
@@ -3150,6 +3179,8 @@ def _render_trade_delete_actions(
                 use_container_width=True,
             ):
                 st.session_state[f"{key_prefix}_multipick"] = []
+                _set_trade_sel_ids(editor_key, set())
+                _bump_trade_editor_widget(editor_key)
                 st.rerun()
         with pick_cols[0]:
             picked_labels = st.multiselect(
@@ -3160,36 +3191,48 @@ def _render_trade_delete_actions(
             )
         picked_extra = [pick_labels[label] for label in picked_labels]
 
-    with st.form(f"{key_prefix}_delete_form", clear_on_submit=False):
-        confirm = st.checkbox(confirm_label, key=f"{key_prefix}_del_confirm")
-        submitted = st.form_submit_button(
-            "🗑️ 선택 거래 삭제",
-            type="primary",
-            use_container_width=True,
-        )
+    sel_count = len(_get_trade_sel_ids(editor_key))
+    if sel_count:
+        st.caption(f"삭제 예정 **{sel_count:,}건** (표·목록·전체선택 합산)")
 
-    if not submitted:
-        return
+    confirm = st.checkbox(confirm_label, key=f"{key_prefix}_del_confirm")
+    if not st.button(
+        "🗑️ 선택 거래 삭제",
+        type="primary",
+        use_container_width=True,
+        key=f"{key_prefix}_del_btn",
+    ):
+        return False
     if not confirm:
         st.warning("삭제 확인 체크박스를 선택해 주세요.")
-        return
+        return True
 
     live_key = widget_key or editor_key
-    live = _coalesce_data_editor_df(live_key, edited)
-    sel_ids = set(st.session_state.get(_trade_sel_ids_key(editor_key), set()))
-    ids = sorted(set(_selected_trade_ids(live)) | sel_ids | set(picked_extra))
+    ids = _resolve_trade_delete_ids(
+        view=view,
+        edited=edited,
+        widget_key=live_key,
+        editor_key=editor_key,
+        picked_extra=picked_extra,
+    )
     if not ids:
-        st.info("삭제할 거래를 선택해 주세요. (표 **선택** 칸 또는 위 목록)")
-        return
+        st.error(
+            "삭제할 거래가 없습니다. **☑ 전체 선택** 또는 아래 **목록 전체** 후 "
+            "다시 시도하세요."
+        )
+        return True
     try:
         n = storage.delete_trades(ids)
         st.session_state["_pending_toast"] = f"거래 {n:,}건을 삭제했습니다."
+        st.success(f"거래 {n:,}건을 삭제했습니다.")
         st.session_state.pop(_trade_sel_ids_key(editor_key), None)
         st.session_state.pop(f"{key_prefix}_multipick", None)
+        st.session_state.pop(f"{key_prefix}_del_confirm", None)
         _bump_trade_editor_widget(editor_key)
         st.rerun()
     except Exception as exc:  # noqa: BLE001
         st.error(str(exc))
+    return True
 
 
 def _render_trade_list(
