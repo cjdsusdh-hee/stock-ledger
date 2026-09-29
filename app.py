@@ -218,6 +218,8 @@ def get_storage() -> Storage:
         "clear_income_records_for_business",
         "get_or_create_account",
         "count_trades_for_account",
+        "delete_trade",
+        "delete_trades",
         "probe_account_column",
         "backfill_unassigned_accounts",
     )
