@@ -833,13 +833,206 @@ def parse_mirae_trade_certificate_income(
     return IncomeParseResult(rows=rows, notes=notes, source="pdf-mirae-cert")
 
 
+_MIRAE_WH_MARKERS = (
+    "미래에셋",
+    "원천징수",
+    "이자·배당소득",
+)
+
+_MIRAE_WH_TX_LINE = re.compile(
+    r"(?P<pay>\d{4}/\d{2}/\d{2})\s+"
+    r"(?P<ym>\d{4}/\d{2})\s+"
+    r"(?P<tax>[CW])\s+"
+    r"(?P<icode>\d+)\s+"
+    r"(?:(?P<prod_slot>B53|NN)\s+)?"
+    r"(?:(?P<prod_code>\S+)\s+)?"
+    r"(?:(?P<period>\d{4}/\d{2}/\d{2}\s*[~～\-]\s*\d{4}/\d{2}/\d{2})\s+)?"
+    r"(?P<rate>\d+(?:\.\d+)?)\s+"
+    r"(?P<amount>-?[\d,]+)\s+"
+    r"(?P<taxrate>\d+(?:\.\d+)?)"
+    r"(?:\s+(?P<skip>-?[\d,]+)\s+(?P<corp>-?[\d,]+)\s+(?P<local>-?[\d,]+)"
+    r"(?:\s+(?P<extra>[\d,]+))?(?:\s+(?P<total>[\d,]+))?)?"
+)
+
+_MIRAE_WH_TICKER_HINT = re.compile(
+    r"^([A-Z][A-Z0-9]{1,9})\s+\d{4}/\d{2}/\d{2}\s*[~～]"
+)
+_MIRAE_WH_NAME_HINT = re.compile(r"^(.+?\S)\s+\d{4}/\d{2}/\d{2}\s*$")
+
+
+def _is_mirae_withholding_pdf(text: str, filename: str = "") -> bool:
+    name = filename or ""
+    if "거래실적" in name or "거래실적증명서" in text:
+        return False
+    if "미래에셋" in name or "mirae" in name.lower():
+        if "원천" in name or "징수" in name:
+            return True
+    hits = sum(1 for m in _MIRAE_WH_MARKERS if m in text or m in name)
+    if hits >= 2:
+        return True
+    return len(_MIRAE_WH_TX_LINE.findall(text)) >= 3
+
+
+def _mirae_wh_product_name(m: re.Match[str], hint: str = "") -> str:
+    if hint:
+        return hint
+    tax = m.group("tax") or ""
+    icode = m.group("icode") or ""
+    code = (m.group("prod_code") or "").strip()
+    if tax == "C":
+        if icode == "18":
+            return "CMA"
+        if icode == "13":
+            return "USD예금"
+        if code:
+            return code
+        return "이자"
+    if code:
+        return code
+    return "배당"
+
+
+def _mirae_wh_products_by_line(lines: list[str]) -> dict[int, str]:
+    products: dict[int, str] = {}
+    for i, line in enumerate(lines):
+        if not _MIRAE_WH_TX_LINE.match(line):
+            continue
+        product = ""
+        if i > 0:
+            prev = lines[i - 1].strip()
+            tm = _MIRAE_WH_TICKER_HINT.match(prev)
+            if tm:
+                product = tm.group(1)
+        if i + 1 < len(lines):
+            nxt = lines[i + 1].strip()
+            if not _MIRAE_WH_TX_LINE.match(nxt):
+                nm = _MIRAE_WH_NAME_HINT.match(nxt)
+                if nm and not nxt.startswith("고객센터"):
+                    name = nm.group(1).strip()
+                    if len(name) >= len(product):
+                        product = name
+        products[i] = product
+    return products
+
+
+def _mirae_wh_row_from_match(
+    m: re.Match[str],
+    *,
+    product: str = "",
+    filename: str = "",
+) -> dict[str, Any]:
+    pay = m.group("pay").replace("/", "-")
+    tax = m.group("tax") or ""
+    icode = m.group("icode") or ""
+    amount = _to_number(m.group("amount"))
+    corp = _to_number(m.group("corp")) if m.group("corp") else 0.0
+    local = _to_number(m.group("local")) if m.group("local") else 0.0
+    period = (m.group("period") or "").replace(" ", "")
+    rate = m.group("rate") or ""
+    pname = _mirae_wh_product_name(m, product)
+    itype = "배당" if tax == "W" else "이자"
+    memo_bits = [
+        "미래에셋 원천징수",
+        f"과세={tax}{icode}",
+    ]
+    if period:
+        memo_bits.append(f"기간={period}")
+    if rate:
+        memo_bits.append(f"이자율={rate}%")
+    if filename:
+        memo_bits.append(filename)
+    return {
+        "지급일": pay,
+        "금융상품명": pname,
+        "증권사": "미래에셋증권",
+        "소득구분": itype,
+        "지급액": amount,
+        "법인세": corp,
+        "지방소득세": local,
+        "메모": " / ".join(memo_bits),
+    }
+
+
+def parse_mirae_withholding_pdf(
+    file_bytes: bytes,
+    filename: str = "",
+    *,
+    password: str | None = None,
+) -> IncomeParseResult:
+    """미래에셋 이자·배당 원천징수영수증 PDF → 거래 라인 추출."""
+    notes: list[str] = []
+    try:
+        raw = _extract_pdf_text(
+            file_bytes, include_tables=False, password=password
+        )
+    except ValueError as exc:
+        return IncomeParseResult(notes=[str(exc)], source="pdf-mirae-wh")
+    except Exception as exc:  # noqa: BLE001
+        return IncomeParseResult(
+            notes=[f"PDF 읽기 실패: {exc}"],
+            source="pdf-mirae-wh",
+        )
+
+    if not raw.strip():
+        return IncomeParseResult(
+            notes=["PDF에서 텍스트를 추출하지 못했습니다. (스캔본이면 OCR 필요)"],
+            source="pdf-mirae-wh",
+        )
+
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    products = _mirae_wh_products_by_line(lines)
+    rows: list[dict[str, Any]] = []
+    for i, line in enumerate(lines):
+        m = _MIRAE_WH_TX_LINE.match(line)
+        if not m:
+            continue
+        amount = _to_number(m.group("amount"))
+        if amount == 0:
+            continue
+        rows.append(
+            _mirae_wh_row_from_match(
+                m,
+                product=products.get(i, ""),
+                filename=filename,
+            )
+        )
+
+    if not rows:
+        return IncomeParseResult(
+            notes=[
+                "미래에셋 원천징수영수증에서 거래 라인을 찾지 못했습니다. "
+                "일반 PDF 파서로 재시도합니다."
+            ],
+            source="pdf-mirae-wh",
+        )
+
+    gross_sum = sum(float(r["지급액"]) for r in rows)
+    corp_sum = sum(float(r["법인세"]) for r in rows)
+    local_sum = sum(float(r["지방소득세"]) for r in rows)
+    div_n = sum(1 for r in rows if r["소득구분"] == "배당")
+    int_n = sum(1 for r in rows if r["소득구분"] == "이자")
+    notes.append(
+        f"미래에셋 원천징수영수증에서 {len(rows)}건을 추출했습니다 "
+        f"(배당 {div_n} · 이자 {int_n}, 지급액 합계 {gross_sum:,.0f} / "
+        f"법인세 {corp_sum:,.0f} / 지방소득세 {local_sum:,.0f}). "
+        "금액·종목명을 미리보기에서 확인한 뒤 저장하세요."
+    )
+    neg_n = sum(1 for r in rows if float(r["지급액"]) < 0)
+    if neg_n:
+        notes.append(
+            f"지급액이 음수인 조정 행 {neg_n}건이 있습니다. "
+            "전표에 포함할지 미리보기에서 확인해 주세요."
+        )
+    return IncomeParseResult(rows=rows, notes=notes, source="pdf-mirae-wh")
+
+
 def parse_income_pdf(
     file_bytes: bytes,
     filename: str = "",
     *,
     password: str | None = None,
 ) -> IncomeParseResult:
-    """원천징수영수증 PDF 파싱. KB 계좌별과세내역·미래에셋 거래실적증명서 전용 파서 우선."""
+    """원천징수영수증 PDF 파싱. KB·미래에셋(원천징수·거래실적) 전용 파서 우선."""
     notes: list[str] = []
     try:
         text = _extract_pdf_text(file_bytes, password=password)
@@ -867,6 +1060,14 @@ def parse_income_pdf(
         if mirae.rows:
             return mirae
         notes.extend(mirae.notes)
+
+    if _is_mirae_withholding_pdf(text, filename):
+        mirae_wh = parse_mirae_withholding_pdf(
+            file_bytes, filename, password=password
+        )
+        if mirae_wh.rows:
+            return mirae_wh
+        notes.extend(mirae_wh.notes)
 
     if _is_kb_withholding_pdf(text, filename):
         kb = parse_kb_interest_pdf(file_bytes, filename, password=password)

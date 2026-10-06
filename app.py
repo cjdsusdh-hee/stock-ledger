@@ -5241,7 +5241,7 @@ def page_income(storage: Storage, business_id: int | None) -> None:
     st.caption(
         "Excel 권장 컬럼: 지급일, 지급액, 법인세, 지방소득세, 금융상품명, 증권사, 소득구분. "
         "KB증권 증권계좌 과세내역조회(원천징수영수증) 엑셀(원거래일자·과세표준)도 지원합니다. "
-        "PDF는 KB 계좌별과세내역·미래에셋 거래실적증명서(배당·예탁금이용료)를 지원합니다. "
+        "PDF는 KB 계좌별과세내역·미래에셋 원천징수영수증·거래실적증명서를 지원합니다. "
         "미리보기에서 수정 후 저장하세요."
     )
     uploaded = st.file_uploader(
