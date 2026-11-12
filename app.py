@@ -41,6 +41,9 @@ import src.voucher_export as _voucher_mod
 import src.income_parser as _income_parser_mod
 import src.income_voucher as _income_voucher_mod
 import src.import_export as _import_export_mod
+import src.brokers.miraeasset as _miraeasset_mod
+import src.brokers.detector as _broker_detector_mod
+import src.brokers as _brokers_mod
 
 _models_mod = importlib.reload(_models_mod)
 _fifo_mod = importlib.reload(_fifo_mod)
@@ -49,6 +52,12 @@ _voucher_mod = importlib.reload(_voucher_mod)
 _income_parser_mod = importlib.reload(_income_parser_mod)
 _income_voucher_mod = importlib.reload(_income_voucher_mod)
 _import_export_mod = importlib.reload(_import_export_mod)
+# 증권사 파서는 위에서 먼저 import 되므로, 클라우드가 프로세스만 재실행하면 옛 파서가 남는다.
+_miraeasset_mod = importlib.reload(_miraeasset_mod)
+_broker_detector_mod = importlib.reload(_broker_detector_mod)
+_brokers_mod = importlib.reload(_brokers_mod)
+detect_and_parse = _brokers_mod.detect_and_parse
+list_brokers = _brokers_mod.list_brokers
 
 AccountConfig = _models_mod.AccountConfig
 IncomeAccountConfig = _models_mod.IncomeAccountConfig
