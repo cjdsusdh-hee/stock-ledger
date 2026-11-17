@@ -222,7 +222,7 @@ def _is_meritz_trade(trade: Trade) -> bool:
 
 
 def _use_amount_remark(_trade: Trade, remark_mode: str) -> bool:
-    """amount 모드: 종목=수량×단가, 증권사=거래/정산금액.
+    """amount 모드: 종목=수량×단가, 증권사=수량×단가±수수료·제세금.
 
     stock 모드는 종목명 / @수량 * 단가 * 환율. 해외도 라디오 선택을 따른다.
     """
@@ -284,8 +284,9 @@ def build_overseas_remark_amount(
 ) -> str:
     """해외주식 전표 적요: USD {앞금액} / {수량}주*{단가} * {환율}.
 
-    front='qty'   → 수량×단가 (종목 줄, 매수·매도 동일)
-    front='excel' → 엑셀 거래/정산금액 (증권사 줄). 없으면 수량×단가
+    front='qty'   → 수량×단가 (종목 줄)
+    front='excel' → 증권사 줄. 매수는 수량×단가+수수료+제세금,
+                    매도는 수량×단가−수수료−제세금.
     """
     qty, price_fx, fx, ccy = _trade_fx_parts(trade)
     side = str(trade.side or "").upper()
@@ -304,7 +305,7 @@ def build_overseas_remark_amount(
         if mode == "qty":
             fx_amt = qty_amt
         elif mode == "excel":
-            fx_amt = stored if stored > 0 else qty_amt
+            fx_amt = _overseas_settle_fx(trade)
         elif stored > 0:
             fx_amt = stored
         elif use_settlement_fx:
@@ -392,7 +393,7 @@ def _fee_summary(trade: Trade, remark_mode: str, *, kind: str = "fee") -> str:
 
 
 def _deposit_summary(trade: Trade, remark_mode: str, base_memo: str) -> str:
-    """증권사(기타제예금) 적요. 저장된 거래/정산금액을 출력 시점에만 읽는다."""
+    """증권사(기타제예금) 적요. 앞금액은 수량×단가±수수료·제세금이다."""
     if _is_overseas_trade(trade) and _use_amount_remark(trade, remark_mode):
         return build_overseas_remark_amount(trade, front="excel")
     return base_memo
