@@ -221,20 +221,12 @@ def _is_meritz_trade(trade: Trade) -> bool:
     return "메리츠" in blob or "meritz" in blob.lower()
 
 
-def _use_amount_remark(trade: Trade, remark_mode: str) -> bool:
-    """해외주식 기본 적요: 종목=수량×단가, 증권사=거래/정산금액."""
-    if _is_overseas_trade(trade):
-        return True
+def _use_amount_remark(_trade: Trade, remark_mode: str) -> bool:
+    """amount 모드: 종목=수량×단가, 증권사=거래/정산금액.
+
+    stock 모드는 종목명 / @수량 * 단가 * 환율. 해외도 라디오 선택을 따른다.
+    """
     return (remark_mode or "").strip().lower() == "amount"
-
-
-def _is_kb_trade(trade: Trade) -> bool:
-    """KB증권 거래 여부 (해외 전표 적요 분기용)."""
-    src = str(getattr(trade, "source", "") or "").lower()
-    acct = str(getattr(trade, "account_name", "") or "")
-    if "kb" in src:
-        return True
-    return "KB" in acct.upper() or "KB증권" in acct
 
 
 def _overseas_settle_fx(trade: Trade) -> float:
@@ -292,7 +284,7 @@ def build_overseas_remark_amount(
 ) -> str:
     """해외주식 전표 적요: USD {앞금액} / {수량}주*{단가} * {환율}.
 
-    front='qty'   → 수량×단가 (매수 종목 줄)
+    front='qty'   → 수량×단가 (종목 줄, 매수·매도 동일)
     front='excel' → 엑셀 거래/정산금액 (증권사 줄). 없으면 수량×단가
     """
     qty, price_fx, fx, ccy = _trade_fx_parts(trade)
@@ -312,11 +304,7 @@ def build_overseas_remark_amount(
         if mode == "qty":
             fx_amt = qty_amt
         elif mode == "excel":
-            side = str(trade.side or "").upper()
-            if side == "BUY":
-                fx_amt = _overseas_settle_fx(trade)
-            else:
-                fx_amt = stored if stored > 0 else qty_amt
+            fx_amt = stored if stored > 0 else qty_amt
         elif stored > 0:
             fx_amt = stored
         elif use_settlement_fx:
@@ -363,7 +351,7 @@ def build_overseas_fee_remark(
 
     side = str(trade.side or "").upper()
     if kind == "tax":
-        label = "주식매도제세금"
+        label = "주식매도제세금" if side == "SELL" else "주식매수제세금"
     elif side == "SELL":
         label = "주식매도수수료"
     else:
@@ -391,7 +379,11 @@ def _fee_summary(trade: Trade, remark_mode: str, *, kind: str = "fee") -> str:
             trade, kind=kind, remark_mode=remark_mode
         )
     if kind == "tax":
-        return "주식매도제세금"
+        return (
+            "주식매도제세금"
+            if str(trade.side or "").upper() == "SELL"
+            else "주식매수제세금"
+        )
     return (
         "주식매도수수료"
         if str(trade.side or "").upper() == "SELL"
@@ -403,12 +395,6 @@ def _deposit_summary(trade: Trade, remark_mode: str, base_memo: str) -> str:
     """증권사(기타제예금) 적요. 저장된 거래/정산금액을 출력 시점에만 읽는다."""
     if _is_overseas_trade(trade) and _use_amount_remark(trade, remark_mode):
         return build_overseas_remark_amount(trade, front="excel")
-    if (
-        remark_mode == "amount"
-        and _is_overseas_trade(trade)
-        and _is_kb_trade(trade)
-    ):
-        return build_overseas_remark_amount(trade, use_settlement_fx=True)
     return base_memo
 
 
@@ -524,7 +510,7 @@ def _trade_summary_buy(trade: Trade, remark_mode: str = "stock") -> str:
 def _trade_summary_sell(trade: Trade, remark_mode: str = "stock") -> str:
     if _is_overseas_trade(trade):
         if _use_amount_remark(trade, remark_mode):
-            return build_overseas_remark_amount(trade)
+            return build_overseas_remark_amount(trade, front="qty")
         return build_overseas_remark(trade)
     name = (trade.stock_name or trade.stock_code or "").strip()
     if remark_mode == "amount":
@@ -565,17 +551,19 @@ def _buy_lines(
     principal = _won(qty * price)
     fee = _won(trade.fee)
     tax = _won(getattr(trade, "tax", 0) or 0)
-    if _is_overseas_trade(trade):
-        # 해외 매수: 증권사 대변 = 종목원금 + 수수료 (+ 제세금) — PDF 출금액과 일치
-        total_out = principal + fee + tax
-    elif trade.settlement_amount is not None:
-        total_out = _won(trade.settlement_amount)
+    components = principal + fee + tax
+    if _is_overseas_trade(trade) or trade.settlement_amount is None:
+        # 해외 매수: 증권사 대변 = 종목원금 + 수수료 + 제세금
+        total_out = components
     else:
-        total_out = principal + fee + tax
+        total_out = _won(trade.settlement_amount)
+    # 대변에 제세금이 포함될 때만 차변을 넣어 차변·대변을 맞춘다.
+    book_tax = tax > 0 and total_out == components
 
     memo = _trade_summary_buy(trade, remark_mode=remark_mode)
     deposit_memo = _deposit_summary(trade, remark_mode, memo)
     fee_memo = _fee_summary(trade, remark_mode, kind="fee")
+    tax_memo = _fee_summary(trade, remark_mode, kind="tax")
     lines: list[VoucherLine] = []
     for item in (
         _line(
@@ -595,6 +583,15 @@ def _buy_lines(
             partner_name=stock_name,
             amount=fee,
             summary=fee_memo,
+        ),
+        _line(
+            ymd=ymd,
+            side=DR,
+            acct=accounts.fee,
+            partner_code=partner_code,
+            partner_name=stock_name,
+            amount=tax if book_tax else 0,
+            summary=tax_memo,
         ),
         _line(
             ymd=ymd,

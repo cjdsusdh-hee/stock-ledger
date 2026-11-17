@@ -3372,23 +3372,28 @@ def page_voucher(
         label_visibility="collapsed",
         help=(
             "회계 전표 엑셀의 적요에 적용됩니다. "
-            "해외주식 기본: 종목 줄은 수량×단가, 증권사 줄은 엑셀 거래/정산금액."
+            "해외 옵션2: 종목 줄은 수량×단가, 증권사 줄은 엑셀 거래/정산금액. "
+            "옵션1: 종목명 / @수량 * 단가 * 환율."
         ),
     )
     remark_mode = _resolve_voucher_memo_mode(market, memo_mode_label)
-    if normalize_market(market) == MARKET_OVERSEAS:
+    overseas = normalize_market(market) == MARKET_OVERSEAS
+    if overseas and remark_mode == "amount":
         st.caption(
             "기본 규칙 — 종목: `USD {수량×단가} / {수량}주*{단가} * {환율}` · "
             "증권사(기타제예금): `USD {거래/정산금액} / {수량}주*{단가} * {환율}` · "
             "수수료: `USD {수수료} * {환율}`"
         )
-    if remark_mode == "stock":
-        st.caption("국내 예: INVESCO NASDAQ 100 매수 / @40주 * $247.67 * 1442.00원")
-    else:
         st.caption(
             "예: 종목 `USD 22922 / 200주*114.61 * 1433.6` · "
             "증권사 `USD 22979.3 / 200주*114.61 * 1433.6`"
         )
+    elif remark_mode == "stock" and overseas:
+        st.caption("예: INVESCO NASDAQ 100 매수 / @40주 * $247.67 * 1442.00원")
+    elif remark_mode == "stock":
+        st.caption("예: 삼성전자 매수 / @10주 * 70,000원")
+    else:
+        st.caption("예: KRW 700000 / 10주*70000")
 
     today = date.today()
     # 구버전 range 키 → 분리 키 마이그레이션
